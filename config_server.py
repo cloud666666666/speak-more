@@ -174,3 +174,35 @@ class ForceAlignerGGUFArgs:
     n_ctx = 4096                # 上下文窗口大小
     dml_pad_to = 30             # 开启 DirectML 加速时，短音频统一填充到指定长度，有加速效果
 
+
+# ============================================================
+#  [补丁] 本地配置覆盖层
+#
+#  把根目录 config_local.json 里的 server 段套到 ServerConfig 上。该文件由
+#  安装向导写入（设置面板不暴露服务端项），实现见 config_local.py。
+#
+#  想恢复出厂设置：删掉根目录下的 config_local.json 即可。
+#
+#  服务端 worker 子进程是 multiprocessing spawn 出来的全新解释器，它会经
+#  core/server/worker/__init__.py 的 `from .. import logger` 重新导入父包，
+#  于是这个块在子进程里也会跑一遍 —— 覆盖层自动生效。但 ProcessManager
+#  不会给运行中的子进程推送新配置，所以改服务端配置仍需重启服务端整体。
+# ============================================================
+try:
+    from config_local import (
+        apply_patch_server_defaults as _apply_patch_defaults,
+        apply_server_overrides as _apply_local_overrides,
+    )
+    _apply_patch_defaults(ServerConfig)     # 先套补丁默认值（如 enable_tray=False）
+    _apply_local_overrides(ServerConfig)    # 再让 config_local.json 盖过它
+except Exception as _e:
+    import traceback as _tb
+    try:
+        from pathlib import Path as _Path
+        _log = _Path(__file__).resolve().parent / 'logs' / 'config_local_error.log'
+        _log.parent.mkdir(parents=True, exist_ok=True)
+        with open(_log, 'a', encoding='utf-8') as _f:
+            _f.write(f'[config_server.py] 应用本地配置覆盖失败: {_e!r}\n{_tb.format_exc()}\n')
+    except Exception:
+        pass
+

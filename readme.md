@@ -1,3 +1,67 @@
+# Speak More
+
+> 这是 **[CapsWriter-Offline](https://github.com/HaujetZhao/CapsWriter-Offline)**（作者
+> [HaujetZhao](https://github.com/HaujetZhao)，MIT）的一个**二次开发分支**。
+> 语音识别内核、模型、热词机制、协议全部来自上游，我们只加了一层
+> **「装好就能用」的外壳** —— 图形设置面板、首次启动向导、统一的托盘与应用图标、
+> 以及按一下键就能改的快捷键。
+
+## 和上游的区别
+
+上游功能很全，但配置全靠手改 `config.py` / `LLM/*.py`。这一版把最常用的那几件事
+搬进了图形界面，并且**一个字节都没回写作者的源码**（配置走 `config_local.json`
+覆盖层，见 `config_local.py` 的文件头说明）。
+
+| | 上游 | 这一版 |
+|---|---|---|
+| 改配置 | 手改 `config_client.py` / `LLM/default.py` | 托盘 → ⚙️ **设置面板**（常用 / 热词 / 关于） |
+| 首次使用 | 自己看文档配 | **首次启动向导**：选麦克风（带 3 秒试录）→ 填 API → 选快捷键 |
+| 快捷键 | 手改配置里的键名 | **点一下按钮，按下你想用的键**（鼠标侧键也能收） |
+| 托盘 | 客户端 + 服务端**两个图标** | 一个图标；服务端由客户端自动拉起、退出自动收掉、崩了自动重启 |
+| 图标 | 各处的默认图标不统一 | 托盘 / 标题栏 / 任务栏 / 黑窗口统一成 Speak More |
+| 识别结果 | 只上屏 | 上屏的同时**自动进剪贴板** |
+| 录音时 | 无反馈 | 屏幕下方一条跟着声音跳的**波形浮层** |
+| LLM 提示词 | 纠错只能依据热词表 | 重写过，**专有名词直接交给大模型**（实测 7/7 纠错、11/11 不误伤） |
+| 开机自启 | 自己弄 | 设置面板里一键开关（带图标的快捷方式） |
+
+**关于热词表**：上游的热词表要用户自己维护，这一版实测下来它真正的价值是
+**「把大模型不认识的那些词告诉它」**（同事名、项目代号、行业黑话），而不是
+替代大模型做替换 —— 公共名词（宇树科技、PyTorch 这类）好的提示词本来就能改对。
+所以「热词」页做成了一个**原文编辑框 + 体检提示**，你只需要往里放自己的词。
+
+上游原有的功能**一个都没删**：文件转录、日记归档、UDP 广播、多角色 LLM、
+热词正则规则等等都在，只是那些"基本不用动"的配置项收进了代码默认值，
+要调可以直接编辑 `config_local.json`。
+
+## 安装
+
+目前是**源码部署**（上游的官方发行版是打包好的 exe，这一版暂时跟进源码）：
+
+```bash
+git clone https://github.com/cloud666666666/<本仓库> speak-more
+cd speak-more
+uv sync              # 或 pip install -r 依赖
+python start_client.py
+```
+
+还需要两样上游要求的东西（仓库里不带）：
+
+- **llama.cpp 的 DLL**：铺到 `core/server/engines/llama/bin/`、
+  `core/server/engines/qwen_asr_gguf/inference/bin/`、
+  `core/server/engines/fun_asr_gguf/inference/bin/` 三个目录（少一个就起不来）
+- **模型**：放到 `models/` 下，结构见 `config_server.py` 的 `ModelPaths`
+
+## 许可
+
+上游是 MIT，这一版同样是 MIT，`LICENSE` 保留原作者署名。
+本仓库内的改动同样以 MIT 发布。
+
+---
+
+# 以下是上游 CapsWriter-Offline 的原始说明
+
+---
+
 # CapsWriter-Offline
 
 ![demo](assets/demo.png)

@@ -128,6 +128,40 @@ r"""
 示例配置：
   {'key': 'caps_lock', 'type': 'keyboard', 'suppress': False, 'hold_mode': True, 'enabled': True}, 
   {'key': 'f12', 'type': 'keyboard', 'suppress': True, 'hold_mode': True, 'enabled': True}, 
-  {'key': 'x2', 'type': 'mouse', 'suppress': True, 'hold_mode': True, 'enabled': True}, 
+  {'key': 'x2', 'type': 'mouse', 'suppress': True, 'hold_mode': True, 'enabled': True},
 """
+
+
+# ============================================================
+#  [补丁] 本地配置覆盖层
+#
+#  把根目录 config_local.json 里的值套到 ClientConfig 上。该文件由
+#  ⚙️ 设置面板 / 安装向导写入，实现见 config_local.py。
+#
+#  想恢复出厂设置：直接删掉根目录下的 config_local.json 即可。
+#
+#  放在文件末尾是有意的 —— 模块体执行到这里时整个 ClientConfig 已经定义完，
+#  而 core/client/__init__.py 的 setup_logger(level=Config.log_level) 在
+#  import 之后才跑，所以连 log_level 这种"导入时快照"的项也能被覆盖。
+#  作者升级时只会往文件中间新增配置项，末尾锚点不会漂移。
+# ============================================================
+try:
+    from config_local import (
+        apply_patch_client_defaults as _apply_patch_defaults,
+        apply_client_overrides as _apply_local_overrides,
+    )
+    _apply_patch_defaults(ClientConfig)     # 先套补丁默认值（如 log_level=INFO）
+    _apply_local_overrides(ClientConfig)    # 再让 config_local.json 盖过它
+except Exception as _e:
+    # 配置层出问题绝不能拖垮程序启动；这里自带一个最小日志，
+    # 因为它坏掉时正是最需要留下痕迹的时候
+    import traceback as _tb
+    try:
+        from pathlib import Path as _Path
+        _log = _Path(__file__).resolve().parent / 'logs' / 'config_local_error.log'
+        _log.parent.mkdir(parents=True, exist_ok=True)
+        with open(_log, 'a', encoding='utf-8') as _f:
+            _f.write(f'[config_client.py] 应用本地配置覆盖失败: {_e!r}\n{_tb.format_exc()}\n')
+    except Exception:
+        pass
 

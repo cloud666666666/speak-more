@@ -23,12 +23,21 @@ Llama.cpp | 拉马点 CPP
 
 
 # ====== 专业术语 ======
-CUDA | 酷的 | kuda 
+CUDA | 酷的 | kuda
 PyTorch
 TensorRT
 DirectML
 TensorFlow
 Transformer
+Typeless | TypePlus | Type Plus | Type-less | 泰普勒斯
+Wispr Flow | 威斯普 Flow | whisper flow
+
+# ====== 机器人 / 具身智能 ======
+# 别名只写**实际会听错的样子**，不写"半个正式名"。
+# 反例：别写 `宇树科技 | 宇树`，那会让用户说"宇树"时也被补成"宇树科技"。
+# 反过来也别写 `云深处 | 云深处科技`，那会把完整的"云深处科技"截短成"云深处"。
+宇树科技 | 雨树科技 | 语数科技 | 与数科技 | 语书科技
+云深处
 
 # ====== 自定义短语示例 ======
 18200006666 | 我的手机号 | input my phone

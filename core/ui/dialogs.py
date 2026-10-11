@@ -48,6 +48,15 @@ def create_modal_dialog(
     dialog = tk.Toplevel()
     dialog.title(title)
 
+    # [补丁] 统一应用图标（见 core/ui/app_icon.py）。这里是作者「编辑上下文」
+    # 「添加热词」两个对话框的公共建窗点，一处设好两处都跟着走 ——
+    # 不设的话标题栏是 Tk 自带的羽毛，跟托盘图标对不上。
+    try:
+        from .app_icon import apply_to_window as _apply_icon
+        _apply_icon(dialog)
+    except Exception:
+        pass
+
     # 先隐藏窗口，避免闪烁
     if withdraw:
         dialog.withdraw()

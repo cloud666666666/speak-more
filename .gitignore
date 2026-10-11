@@ -188,3 +188,24 @@ release
 *.exe
 
 models/**/*.cfg
+
+# ============================================================
+#  Speak More 补丁新增的忽略项
+# ============================================================
+
+# 本地运行态配置 —— **里面存着用户的 API Key，绝对不能入库**。
+# 每个用户的 config_local.json 都不一样，仓库里不带它；
+# 代码里的默认值（config_local.PATCH_*_DEFAULTS）保证 clone 下来就能用。
+config_local.json
+config_local.json.bak
+config_local.json.bak.*
+config_local.json.tmp
+
+# 热词表写入时留的备份（hot.txt 本身是跟踪的，模板要跟着仓库走）
+hot.txt.bak
+hot-rule.txt.bak
+*.tmp
+
+# Windows 杂物
+Thumbs.db
+Desktop.ini

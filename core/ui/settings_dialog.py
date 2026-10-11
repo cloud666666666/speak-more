@@ -1,0 +1,1390 @@
+# coding: utf-8
+"""
+设置面板的纯 UI 层
+
+职责边界（重要）：
+    本文件**只吃 dict、只吐 DialogResult**，完全不知道 Config / app 的存在。
+    所有跟作者代码打交道的事都收在：
+      - core/ui/settings_handler.py   （线程模型 + 快照 + 保存编排）
+      - core/client/settings_apply.py （热生效）
+    这样作者升级要改的只有那两个文件。
+
+两个刻意的设计：
+  1. **不做模态**。没有 grab_set() / transient()。用户要能一边开着设置
+     一边对照文档、一边操作桌面。core/ui/dialogs.py 的 create_modal_dialog()
+     在这里不能用。
+  2. 每页可滚动。字段多的页签（输出行为、高级）会超出屏幕高度。
+
+输入输出契约：
+    show(snapshot) -> DialogResult
+    snapshot = {
+        'client':       {'<ClientConfig 字段>': 当前值, ...},
+        'llm_roles':    {'默认': {'api_key': ..., 'model': ...}, ...},
+        'role_names':   ['默认', ...],
+        'current_role': '默认',
+        'devices':      [(显示名, 设备名), ...],   # 麦克风候选，首项是「系统默认」
+        'meta':         '补丁 v0.1.0 · ...',        # 底部状态栏
+        'base_version': '2.6',
+    }
+    DialogResult.data = {
+        'client':    {'<被改过的字段>': 新值, ...},
+        'llm_roles': {'<角色名>': {'<被改过的字段>': 新值}},
+        'reset':     True/不存在,
+    }
+"""
+
+from __future__ import annotations
+
+import os
+import queue
+import threading
+import tkinter as tk
+from pathlib import Path
+from tkinter import messagebox, ttk
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+from core.ui import settings_schema as S
+from . import key_capture as kc
+from . import logger
+from .mic_test import MicTestPanel
+
+# 安装目录（core/ui/settings_dialog.py -> 往上三级）
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+try:                                    # 软依赖：拿不到就用兜底值
+    from core.ui.toast_constants import DEFAULT_FONT_FAMILY
+except Exception:
+    DEFAULT_FONT_FAMILY = 'Microsoft YaHei UI'
+
+try:
+    from core.ui.dialogs import DialogResult
+except Exception:                       # 兜底，保证本模块可独立 import
+    class DialogResult:
+        def __init__(self, confirmed: bool = False, **data: Any):
+            self.confirmed = confirmed
+            self.data = data
+
+        def __bool__(self) -> bool:
+            return self.confirmed
+
+        def get(self, key: str, default: Any = None) -> Any:
+            return self.data.get(key, default)
+
+try:
+    from core.branding import SETTINGS_TITLE
+except Exception:
+    SETTINGS_TITLE = '设置'
+
+
+F_NORMAL = (DEFAULT_FONT_FAMILY, 10)
+F_SMALL = (DEFAULT_FONT_FAMILY, 9)
+F_HINT = (DEFAULT_FONT_FAMILY, 8)
+F_TITLE = (DEFAULT_FONT_FAMILY, 11, 'bold')
+F_GROUP = (DEFAULT_FONT_FAMILY, 10, 'bold')     # 页内分组的小标题
+F_MONO = ('Consolas', 10)
+
+INK = '#1f2937'                 # 正文/小标题
+HINT_COLOR = '#8a8a8a'
+WARN_COLOR = '#c07000'
+
+# 快捷键的两种触发方式。
+# 用下拉框而不是勾选框：勾选框表达"按住 / 不按住"两个选项很别扭
+# （用户会问"不勾是什么意思"），而且之前旁边还有「阻塞」「启用」两个勾，
+# 三个勾并排完全看不懂。
+MODE_HOLD = '按住说话，松开上屏'
+MODE_TOGGLE = '点一下开始 / 再点一下结束'
+_SHORTCUT_MODES = (MODE_HOLD, MODE_TOGGLE)
+
+# 鼠标侧键
+_MOUSE_KEYS = frozenset({'x1', 'x2'})
+
+
+def _key_to_type(key: str) -> str:
+    """按键名推导输入类型 —— 用户不需要手选，看名字就知道。"""
+    return 'mouse' if key.strip().lower() in _MOUSE_KEYS else 'keyboard'
+
+
+# ============================================================
+#  可滚动容器
+# ============================================================
+
+class _ScrollFrame(ttk.Frame):
+    """一个内部可滚动的 Frame。把控件加到 .body 上。"""
+
+    def __init__(self, master: tk.Misc, **kw: Any):
+        super().__init__(master, **kw)
+        self._canvas = tk.Canvas(self, highlightthickness=0, borderwidth=0)
+        sb = ttk.Scrollbar(self, orient='vertical', command=self._canvas.yview)
+        self.body = ttk.Frame(self._canvas)
+
+        self._win = self._canvas.create_window((0, 0), window=self.body, anchor='nw')
+        self._canvas.configure(yscrollcommand=sb.set)
+        self._canvas.pack(side='left', fill='both', expand=True)
+        sb.pack(side='right', fill='y')
+
+        self.body.bind('<Configure>',
+                       lambda _e: self._canvas.configure(
+                           scrollregion=self._canvas.bbox('all')))
+        self._canvas.bind('<Configure>',
+                          lambda e: self._canvas.itemconfigure(self._win, width=e.width))
+        # 鼠标在面板上时滚轮才生效，避免抢走别的窗口的滚轮
+        self._canvas.bind('<Enter>', lambda _e: self._canvas.bind_all(
+            '<MouseWheel>', self._on_wheel))
+        self._canvas.bind('<Leave>', lambda _e: self._canvas.unbind_all('<MouseWheel>'))
+
+    def _on_wheel(self, event: Any) -> None:
+        if self._canvas.yview() != (0.0, 1.0):
+            self._canvas.yview_scroll(int(-event.delta / 120), 'units')
+
+
+# ============================================================
+#  主对话框
+# ============================================================
+
+class SettingsDialog:
+    """设置面板。见文件头的输入输出契约。"""
+
+    def __init__(self, parent: Optional[tk.Misc] = None,
+                 mic_apply: Optional[Callable[[str], bool]] = None,
+                 key_capture: Optional[Callable[..., Any]] = None):
+        """
+        Args:
+            parent: 父窗口
+            mic_apply: 「测试麦克风」前用它把选中的设备真正应用上去
+                       （改配置 + 重开音频流）。签名 (设备名) -> 是否成功。
+                       由 core/ui/settings_handler.py 注入 —— 本模块是纯 UI，
+                       拿不到 app 对象，也刻意不拿。
+            key_capture: 「按一下键就捕获」。签名 (timeout, cancel) -> CaptureResult。
+                       同样由 settings_handler 注入：捕获时必须先把宿主 app 的
+                       快捷键监听停掉（否则 CapsLock 这类会被应用自己吞掉），
+                       而那需要 app 对象。见 core/ui/key_capture.py。
+        """
+        self._parent = parent
+        self._mic_apply = mic_apply
+        self._key_capture = key_capture
+        self.result: Optional[DialogResult] = None
+        self._dialog: Optional[tk.Toplevel] = None
+
+        self._vars: Dict[str, tk.Variable] = {}
+        self._widgets: Dict[str, tk.Widget] = {}
+        self._choice_maps: Dict[str, Dict[str, str]] = {}
+        self._multiline: Dict[str, tk.Text] = {}
+        self._shortcut_rows: List[Dict[str, Any]] = []
+        self._shortcut_holder: Optional[ttk.Frame] = None
+        # 按键捕获的状态（捕获跑在后台线程，Tk 这边轮询结果）
+        self._shortcut_status: Optional[ttk.Label] = None
+        self._capturing_row: Optional[Dict[str, Any]] = None
+        self._capture_cancel: Optional[threading.Event] = None
+        self._capture_queue: Optional[queue.Queue] = None
+
+        # 角色相关：LLM 页签顶部的下拉 + 每个角色的值缓存
+        self._role_names: List[str] = []
+        self._current_role: str = ''
+        self._role_cache: Dict[str, Dict[str, Any]] = {}
+        self._role_var: Optional[tk.StringVar] = None
+        self._device_choices: List[Tuple[str, str]] = []
+
+        # 「热词」页的状态。_hot_manual 为 None 表示这一页没建出来 ——
+        # _collect_hotwords() 靠它判断"要不要动磁盘上的 hot.txt"。
+        self._hot_manual: Optional[tk.Text] = None
+        self._hot_lint: Optional[ttk.Label] = None
+
+    # ---------------- 对外入口 ----------------
+
+    def show(self, snapshot: Dict[str, Any]) -> DialogResult:
+        own_root = None
+        if self._parent is None:
+            own_root = tk.Tk()
+            own_root.withdraw()
+            parent: tk.Misc = own_root
+        else:
+            parent = self._parent
+
+        try:
+            self._build(parent, snapshot)
+            self._dialog.wait_window()          # type: ignore[union-attr]
+        finally:
+            # 必须在这里也清一次：窗口有可能是被外部直接 destroy 的
+            # （比如管理器那边统一收尾），那样 _close() 不会跑。
+            self._forget_tk_vars()
+            if own_root is not None:
+                try:
+                    own_root.destroy()
+                except Exception:
+                    pass
+
+        return self.result or DialogResult(confirmed=False)
+
+    # ---------------- 建窗 ----------------
+
+    def _build(self, parent: tk.Misc, snap: Dict[str, Any]) -> None:
+        snapshot = self._normalize(snap)
+
+        dlg = tk.Toplevel(parent)
+        self._dialog = dlg
+        dlg.title(SETTINGS_TITLE)
+        # 标题栏 + 任务栏 + Alt+Tab 三处图标一次设好（见 core/ui/app_icon.py）。
+        # 放在 withdraw() 之前也没问题：设的是窗口属性，deiconify 时自然带上。
+        try:
+            from .app_icon import apply_to_window as _apply_icon
+            _apply_icon(dlg)
+        except Exception as _e:
+            logger.debug(f'设置面板图标设置失败: {_e}')
+        dlg.withdraw()
+        dlg.resizable(True, True)
+        dlg.minsize(760, 540)
+        # 刻意不调 dlg.transient() / dlg.grab_set()：见文件头说明
+
+        outer = ttk.Frame(dlg, padding=10)
+        outer.pack(fill='both', expand=True)
+
+        # ---- 底部按钮条 ----
+        #
+        # **必须最先 pack，而且用 side='bottom'** —— 这是踩过的大坑：
+        # Notebook 的"请求高度"等于最高那一页的内容高度（「高级」页有 26 项、
+        # 一千多像素），先 pack 它的话会把窗口塞满，后面才 pack 的按钮条
+        # 只能分到 **1 像素** —— 「保存」和「取消」直接看不见。
+        #
+        # 表现极具迷惑性：面板用着完全正常，只是用户改完设置**找不到保存**，
+        # 于是所有改动都不生效，还以为是功能坏了。
+        status = ttk.Frame(outer)
+        status.pack(side='bottom', fill='x', pady=(8, 0))
+
+        # **按钮先 pack，状态文字后 pack**。
+        # pack 是按顺序分配宽度的：文字先占的话，长文字会把按钮挤成 0 宽 ——
+        # 踩过：状态栏那行 85 个字符把「保存」挤到 **1 像素**，
+        # 看得见字样但点不到，用户改完设置根本存不进去。
+        btns = ttk.Frame(status)
+        btns.pack(side='right')
+        for text, cmd in (('取消', self._on_cancel),
+                          ('保存', self._on_confirm)):
+            ttk.Button(btns, text=text, command=cmd).pack(side='left', padx=4)
+
+        meta = ttk.Label(status, text=str(snapshot.get('meta', '')), font=F_HINT,
+                         foreground=HINT_COLOR, anchor='w')
+        meta.pack(side='left', fill='x', expand=True)
+
+        # 「恢复默认」搬到「关于」页去了 —— 它跟保存/取消不是一类操作，
+        # 并排摆着的时候被误点过好几次，每次都会把 config_local.json
+        # 整个改名备份掉，用户改了半天的设置就这么没了。
+
+        # ---- 内容区（吃掉剩余空间）----
+        # 面板分三页：常用 / 高级 / 关于。
+        # 之前是 7 个页签、35 个配置项平铺 —— 那不是"开箱即用"，
+        # 那是"给你一堆开关自己研究"。功能一个没删，只是把
+        # 有合理默认值、基本不用动的收进了「高级」。
+        nb = ttk.Notebook(outer)
+        nb.pack(side='top', fill='both', expand=True)
+
+        for tier, tab_title in S.TIERS:
+            if tier == 'about':
+                page = _ScrollFrame(nb)
+                nb.add(page, text=tab_title)
+                self._build_about(page.body)
+                continue
+
+            if tier == 'hotwords':
+                # 「热词」页没有字段表 —— 自动学到的词要能逐条增删改，
+                # 声明式字段表表达不了这种结构，所以自己画。
+                page = _ScrollFrame(nb)
+                nb.add(page, text=tab_title)
+                self._build_hotwords(page.body, snapshot)
+                continue
+
+            groups = S.groups_in_tier(tier)
+            if not groups:
+                continue
+
+            page = _ScrollFrame(nb)
+            nb.add(page, text=tab_title)
+            row = 0
+            for gi, group in enumerate(groups):
+                if gi > 0:
+                    ttk.Separator(page.body, orient='horizontal').grid(
+                        row=row, column=0, columnspan=3, sticky='ew',
+                        padx=8, pady=(18, 0))
+                    row += 1
+                row = self._build_group(page.body, group, snapshot, row)
+
+        dlg.protocol('WM_DELETE_WINDOW', self._on_cancel)
+        # Esc 走 _on_escape：正在捕获时它取消**捕获**，而不是关掉整个面板
+        # （用户想取消捕获反而丢了改了一半的设置，是最招人烦的失败模式）
+        dlg.bind('<Escape>', self._on_escape)
+
+        self._center(dlg, 840, 660)
+
+    def _normalize(self, snap: Dict[str, Any]) -> Dict[str, Any]:
+        """把外部快照整理成本对话框内部用的形式，补齐缺省。"""
+        client = dict(snap.get('client') or {})
+        roles = snap.get('llm_roles') or {}
+        self._role_names = list(snap.get('role_names') or list(roles) or ['默认'])
+        self._current_role = str(snap.get('current_role') or self._role_names[0])
+        self._role_cache = {name: dict(vals or {}) for name, vals in roles.items()}
+        for name in self._role_names:
+            self._role_cache.setdefault(name, {})
+        self._device_choices = list(snap.get('devices') or [('系统默认', '')])
+        return {'client': client, **snap}
+
+    def _build_group(self, body: ttk.Frame, group: S.Group,
+                     snap: Dict[str, Any], start_row: int = 0) -> int:
+        body.columnconfigure(1, weight=1)
+        row = start_row
+
+        # 组标题。一个页里有好几组，靠它分段。
+        ttk.Label(body, text=group.title, font=F_GROUP,
+                  foreground=INK).grid(
+            row=row, column=0, columnspan=3, sticky='w',
+            padx=8, pady=(14, 2))
+        row += 1
+
+        if group.note:
+            ttk.Label(body, text=group.note, font=F_HINT, foreground=HINT_COLOR,
+                      wraplength=740, justify='left').grid(
+                row=row, column=0, columnspan=3, sticky='w',
+                padx=8, pady=(0, 10))
+            row += 1
+
+        basic = [f for f in group.fields if f.section == 'basic']
+        advanced = [f for f in group.fields if f.section == 'advanced']
+
+        for f in basic:
+            row += self._build_field(body, f, snap, row)
+
+        # LLM 组紧跟在连接信息后面放一个「测试连接」
+        if group.id == 'llm':
+            row += self._build_llm_test(body, row)
+
+        # 麦克风组：选完设备直接能测，不用先保存再回来试
+        if group.id == 'mic':
+            row += self._build_mic_test(body, row)
+
+        if advanced:
+            holder = ttk.LabelFrame(body, text=' 更多 ', padding=(8, 4))
+            holder.grid(row=row, column=0, columnspan=3, sticky='ew',
+                        padx=8, pady=(10, 8))
+            holder.columnconfigure(1, weight=1)
+            arow = 0
+            for f in advanced:
+                arow += self._build_field(holder, f, snap, arow)
+            row += 1
+
+        return row
+
+    def _build_about(self, body: ttk.Frame) -> None:
+        """
+        「关于」页：版本、日志、以及那些"出问题时才用得上"的按钮。
+
+        恢复默认放在这里，是因为它跟保存/取消不是一类操作 ——
+        之前并排摆着，用户误点过好几次，把改好的配置整个重置掉。
+        """
+        body.columnconfigure(0, weight=1)
+        row = 0
+
+        try:
+            from core.branding import APP_NAME, UPSTREAM_NAME, UPSTREAM_URL
+        except Exception:
+            APP_NAME, UPSTREAM_NAME, UPSTREAM_URL = 'Speak More', '', ''
+
+        try:
+            import config_client
+            version = getattr(config_client, '__version__', '?')
+        except Exception:
+            version = '?'
+
+        ttk.Label(body, text=APP_NAME, font=F_TITLE, foreground=INK).grid(
+            row=row, column=0, columnspan=3, sticky='w', padx=8, pady=(14, 2))
+        row += 1
+        ttk.Label(body, text=f'内核 {version}　（基于 {UPSTREAM_NAME} 二次开发）',
+                  font=F_SMALL, foreground=HINT_COLOR).grid(
+            row=row, column=0, columnspan=3, sticky='w', padx=8, pady=(0, 6))
+        row += 1
+
+        try:
+            from config_local import status_summary
+            status = status_summary()
+        except Exception:
+            status = ''
+        if status:
+            ttk.Label(body, text=status, font=F_HINT, foreground=HINT_COLOR,
+                      wraplength=740, justify='left').grid(
+                row=row, column=0, columnspan=3, sticky='w',
+                padx=8, pady=(0, 14))
+            row += 1
+
+        ttk.Separator(body, orient='horizontal').grid(
+            row=row, column=0, columnspan=3, sticky='ew', padx=8, pady=(4, 12))
+        row += 1
+
+        ttk.Label(body, text='出问题时', font=F_GROUP, foreground=INK).grid(
+            row=row, column=0, columnspan=3, sticky='w', padx=8, pady=(0, 6))
+        row += 1
+
+        btns = ttk.Frame(body)
+        btns.grid(row=row, column=0, columnspan=3, sticky='w', padx=8, pady=(0, 8))
+        row += 1
+
+        ttk.Button(btns, text='打开日志文件夹', command=self._open_logs).pack(
+            side='left', padx=(0, 8))
+        ttk.Button(btns, text='打开安装目录', command=self._open_install_dir).pack(
+            side='left', padx=(0, 8))
+
+        ttk.Label(body,
+                  text='出问题时的排查顺序：先看 logs\\client_latest.log 的最后几十行；'
+                       '那里记着每次保存提交了什么、有没有报错。',
+                  font=F_HINT, foreground=HINT_COLOR, wraplength=740,
+                  justify='left').grid(row=row, column=0, columnspan=3,
+                                       sticky='w', padx=8, pady=(0, 16))
+        row += 1
+
+        ttk.Separator(body, orient='horizontal').grid(
+            row=row, column=0, columnspan=3, sticky='ew', padx=8, pady=(4, 12))
+        row += 1
+
+        ttk.Label(body, text='恢复出厂设置', font=F_GROUP, foreground=INK).grid(
+            row=row, column=0, columnspan=3, sticky='w', padx=8, pady=(0, 6))
+        row += 1
+        ttk.Label(body,
+                  text='会删掉根目录的 config_local.json，所有设置回到程序自带的默认值'
+                       '（会先备份一份）。',
+                  font=F_HINT, foreground=WARN_COLOR, wraplength=740,
+                  justify='left').grid(row=row, column=0, columnspan=3,
+                                       sticky='w', padx=8, pady=(0, 6))
+        row += 1
+        ttk.Button(body, text='恢复默认…', command=self._on_reset).grid(
+            row=row, column=0, sticky='w', padx=8, pady=(0, 16))
+
+    def _open_logs(self) -> None:
+        self._open_dir(Path(REPO_ROOT) / 'logs')
+
+    def _open_install_dir(self) -> None:
+        self._open_dir(Path(REPO_ROOT))
+
+    @staticmethod
+    def _open_dir(path: Path) -> None:
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            os.startfile(str(path))            # noqa: S606 (Windows only)
+        except Exception as e:
+            logger.debug(f'打开目录失败 {path}: {e}')
+
+    # ---------------- 「热词」页 ----------------
+
+    def _build_hotwords(self, body: ttk.Frame, snap: Dict[str, Any]) -> None:
+        """
+        「热词」页：编辑 hot.txt。
+
+        热词表的作用有两层，写清楚给用户看：
+          ① **本地强制替换** —— 命中的词在识别结果里直接换掉，跑在大模型之前，
+             瞬间、确定性、不花钱；
+          ② **作为上下文喂给大模型** —— 命中的词会以「热词列表：[...]」的形式
+             进提示词。这一层是给大模型补它拿不到的信息。
+
+        ②比①重要得多，实测：
+          - 大模型不知道的词（同事「老汪」其实是「老王」）：
+            没有热词时 8 次全改不动；把「老王」放进热词表后 8/8 全改对。
+          - 大模型偶尔改坏写对的专有名词（「松鼠云」被改成「松树云」，8 次里 2 次）：
+            把「松鼠云」放进热词表后 8/8 全保住。
+
+        所以这一页的定位是「告诉大模型你的词」，不是「替大模型干活」。
+
+        ⚠️ 读不到 hot.txt 时**整个不建编辑框**。建了的话用户点保存 =
+        用空内容覆盖掉磁盘上的文件。保持 _hot_manual 为 None，
+        _collect_hotwords() 就会返回 None，调用方也就不会去动文件。
+        """
+        body.columnconfigure(0, weight=1)
+        row = 0
+
+        hw = snap.get('hotwords') or {}
+        manual_text = hw.get('manual')
+
+        ttk.Label(body, text='热词表 hot.txt', font=F_GROUP, foreground=INK).grid(
+            row=row, column=0, sticky='w', padx=8, pady=(14, 2))
+        row += 1
+        ttk.Label(
+            body,
+            text=('把你自己的人名、公司名、项目代号、专业术语写进来。\n'
+                  '大模型不认识这些词 —— 你不告诉它，它就没法改对，甚至可能改坏。\n'
+                  '命中之后有两个作用：① 本地直接替换（快、每次都一样）；'
+                  '② 作为「热词列表」喂给\n大模型，让它知道这个写法是对的。'),
+            font=F_HINT, foreground=HINT_COLOR, wraplength=740,
+            justify='left').grid(row=row, column=0, sticky='w', padx=8, pady=(0, 8))
+        row += 1
+
+        if manual_text is None:
+            ttk.Label(body, text='（读不到 hot.txt，这一页暂时不可用）',
+                      font=F_SMALL, foreground=WARN_COLOR).grid(
+                row=row, column=0, sticky='w', padx=8, pady=(0, 12))
+            return
+
+        ttk.Label(
+            body,
+            text=('写法：每行一个词，用 | 分隔别名 —— `宇树科技 | 雨树科技 | 语数科技`\n'
+                  '　　　要阻止某个替换，在该行后面加 `~~~ 要保护的词`；'
+                  '# 开头的是注释'),
+            font=F_HINT, foreground=HINT_COLOR, wraplength=740,
+            justify='left').grid(row=row, column=0, sticky='w', padx=8, pady=(0, 6))
+        row += 1
+
+        self._hot_manual = tk.Text(body, height=16, wrap='none', font=F_MONO,
+                                   relief='solid', borderwidth=1)
+        self._hot_manual.grid(row=row, column=0, sticky='ew', padx=8, pady=(0, 6))
+        self._hot_manual.insert('1.0', manual_text)
+        row += 1
+
+        # 可疑写法提示。热词表有个静默的坑：一个词完整包含另一个词
+        # （`宇树科技 | 宇树`）会让用户每说一次"宇树"都被补成"宇树科技"。
+        # 文件本身看不出问题，纠错也不报错，所以在这里体检一下。
+        self._hot_lint = ttk.Label(body, text='', font=F_HINT,
+                                   foreground=WARN_COLOR, wraplength=740,
+                                   justify='left')
+        self._hot_lint.grid(row=row, column=0, sticky='w', padx=8, pady=(0, 6))
+        row += 1
+
+        ttk.Button(body, text='打开所在文件夹',
+                   command=lambda: self._open_dir(Path(REPO_ROOT))).grid(
+            row=row, column=0, sticky='w', padx=8, pady=(0, 16))
+
+        self._refresh_hot_lint()
+
+    def _refresh_hot_lint(self) -> None:
+        """跑一遍热词表体检，把可疑行显示出来。"""
+        if self._hot_manual is None or self._hot_lint is None:
+            return
+        try:
+            from core.client.hotword.hot_file import lint
+            warns = lint(self._hot_manual.get('1.0', 'end-1c'))
+        except Exception:
+            warns = []
+        try:
+            self._hot_lint.configure(text=('\n'.join(warns) if warns else ''))
+        except Exception:
+            pass
+
+    def _collect_hotwords(self) -> Optional[Dict[str, Any]]:
+        """
+        收集这一页的内容。返回 None 表示"这一页没建出来，别动磁盘上的文件"。
+
+        ⚠️ 返回 None 这件事很重要：`_collect()` 的结果会被当成"用户想要的
+        全部配置"落盘。要是这页没建（比如测试里只建了别的页），返回个空串
+        就等于**把用户的热词表清空了**。
+        """
+        if self._hot_manual is None:
+            return None
+        try:
+            return {'manual': self._hot_manual.get('1.0', 'end-1c')}
+        except Exception:
+            return None
+
+
+    def _build_llm_test(self, body: ttk.Frame, row: int) -> int:
+        """
+        连通性测试。
+
+        用的是**界面上当前填的值**，而不是已保存的值 —— 用户填完
+        地址和 Key 应该能立刻试通再保存，而不是先存再回来试。
+        """
+        holder = ttk.Frame(body)
+        holder.grid(row=row, column=0, columnspan=3, sticky='ew',
+                    padx=8, pady=(4, 8))
+
+        self._btn_llm_test = ttk.Button(holder, text='测试连接', width=12,
+                                        command=self._on_test_llm)
+        self._btn_llm_test.pack(side='left')
+
+        self._llm_test_label = tk.Label(holder, text='', font=F_SMALL,
+                                        bg='white', fg=HINT_COLOR,
+                                        wraplength=520, justify='left')
+        self._llm_test_label.pack(side='left', padx=10)
+        return 1
+
+    def _on_test_llm(self) -> None:
+        url = str(self._vars.get('llm.api_url').get()).strip() if self._vars.get('llm.api_url') else ''
+        key = str(self._vars.get('llm.api_key').get()).strip() if self._vars.get('llm.api_key') else ''
+        model = str(self._vars.get('llm.model').get()).strip() if self._vars.get('llm.model') else ''
+
+        self._btn_llm_test.configure(state='disabled')
+        self._llm_test_label.configure(text='正在测试…', fg=HINT_COLOR)
+
+        def worker() -> None:
+            try:
+                # 延迟导入，避免 UI 层在 import 期就依赖客户端的 LLM 子系统
+                from core.client.llm.llm_test import test_connection
+                from core.ui import settings_schema as _S
+                ok, msg = test_connection(_S.GENERIC_PROVIDER, url, key, model)
+            except Exception as e:
+                ok, msg = False, f'测试出错: {e}'
+
+            def apply() -> None:
+                try:
+                    self._llm_test_label.configure(text=msg,
+                                                   fg='#15803d' if ok else '#b91c1c')
+                    self._btn_llm_test.configure(state='normal')
+                except Exception:
+                    pass
+
+            try:
+                if self._dialog is not None:
+                    self._dialog.after(0, apply)
+            except Exception:
+                pass
+
+        threading.Thread(target=worker, daemon=True, name='LLMTestPanel').start()
+
+    def _build_mic_test(self, body: ttk.Frame, row: int) -> int:
+        """
+        麦克风那一栏的「测试麦克风」。
+
+        用的是界面上当前选中的设备（会先把它应用上去），不是已保存的值 ——
+        用户换个设备应该能立刻试，而不用"保存 → 重启音频流 → 再回来听"。
+        """
+        holder = ttk.Frame(body)
+        holder.grid(row=row, column=0, columnspan=3, sticky='ew',
+                    padx=8, pady=(4, 2))
+
+        self._mic_test = MicTestPanel(
+            holder,
+            get_device=self._current_mic_device,
+            mic_apply=self._mic_apply,
+            bg='white', font=F_SMALL)
+        self._mic_test.pack(fill='x')
+
+        ttk.Label(body,
+                  text='换个设备先点这里试一下，免得保存完才发现选错了。',
+                  font=F_HINT, foreground=HINT_COLOR).grid(
+            row=row + 1, column=0, columnspan=3, sticky='w',
+            padx=8, pady=(0, 8))
+        return 2
+
+    def _current_mic_device(self) -> str:
+        """界面上当前选中的设备名（显示名 -> 真实值）。"""
+        var = self._vars.get('mic_device')
+        if var is None:
+            return ''
+        mapping = self._choice_maps.get('mic_device') or {}
+        return str(mapping.get(str(var.get()), '') or '')
+
+    def _value_of(self, f: S.Field, snap: Dict[str, Any]) -> Any:
+        """
+        取字段当前值。
+
+        角色字段（llm.*）做两处修正：
+          - 作者在 LLM/*.py 里留的脱敏假 key（一串 *）当空，否则用户
+            会以为已经配好了；
+          - 空值补默认值。Base URL 现在是唯一的连接信息，空着一定是错的，
+            给个能用的起点比让用户对着空框发呆好。
+        """
+        if not S.is_role_field(f.key):
+            return snap['client'].get(f.key, f.default)
+
+        current = self._current_role_values().get(S.role_attr(f.key), f.default)
+        if S.is_placeholder_secret(current):
+            current = ''
+        return f.default if current in (None, '') else current
+
+    def _build_field(self, body: ttk.Frame, f: S.Field,
+                     snap: Dict[str, Any], row: int) -> int:
+        current = self._value_of(f, snap)
+
+        if f.key == 'shortcuts':
+            ttk.Label(body, text=f.label, font=F_NORMAL).grid(
+                row=row, column=0, sticky='nw', padx=(8, 10), pady=6)
+            self._build_shortcut_editor(body, current, row)
+            next_row = row + 4
+
+        elif f.kind == 'bool':
+            # 勾选框自带标签，而且标签本身可以点 ——
+            # 原来是"标签在左、一个光秃秃的方框在右"，那个方框太容易被
+            # 当成空白格子忽略掉（用户反馈过"没看到可以勾选的框"）。
+            var = self._new_var('bool', bool(current))
+            cb = ttk.Checkbutton(body, text=f.label, variable=var)
+            cb.grid(row=row, column=0, columnspan=2, sticky='w',
+                    padx=8, pady=6)
+            self._vars[f.key] = var
+            self._widgets[f.key] = cb
+            next_row = row + 1
+
+        elif f.stacked:
+            # URL / Key 这类长字段：标签单独一行，输入框占满下一行
+            ttk.Label(body, text=f.label, font=F_NORMAL).grid(
+                row=row, column=0, columnspan=2, sticky='w',
+                padx=8, pady=(8, 0))
+            self._build_simple(body, f, current, row + 1, span=True)
+            next_row = row + 2
+
+        else:
+            ttk.Label(body, text=f.label, font=F_NORMAL).grid(
+                row=row, column=0, sticky='nw', padx=(8, 10), pady=6)
+            self._build_simple(body, f, current, row, span=False)
+            next_row = row + 1
+
+        hint_parts = [f.hint] if f.hint else []
+        if f.effect != 'hot':
+            hint_parts.append(S.EFFECT_TEXT.get(f.effect, ''))
+        if hint_parts:
+            ttk.Label(body, text='  '.join(h for h in hint_parts if h),
+                      font=F_HINT,
+                      foreground=WARN_COLOR if f.effect != 'hot' else HINT_COLOR,
+                      wraplength=700, justify='left').grid(
+                row=next_row, column=0, columnspan=2,
+                sticky='w', padx=8, pady=(0, 8))
+            next_row += 1
+
+        return next_row - row
+
+    def _current_role_values(self) -> Dict[str, Any]:
+        return self._role_cache.get(self._role_var.get() if self._role_var
+                                    else self._current_role, {})
+
+    # ---------------- Tk 变量 ----------------
+
+    def _new_var(self, kind: str, value: Any = None) -> tk.Variable:
+        """
+        建 Tk 变量 —— **一律显式绑定 master**，不要图省事用 `tk.BooleanVar()`。
+
+        不传 master 时 Tkinter 会用模块级的 `_default_root`。这个程序里有
+        好几个 Tk 根（toast 管理器、录音浮层、上下文对话框、本面板各一个），
+        `_default_root` 指向哪个完全看谁最后建 —— 而根是分线程建的。
+
+        变量一旦挂到**别的解释器**上，勾选框在自己的解释器里读不到它，
+        就会被当成"未设置"，渲染成三态的横线：
+        点一下变成空白、再点一下才打勾。用户看到的就是"这个勾选框坏了"。
+        """
+        cls = tk.BooleanVar if kind == 'bool' else tk.StringVar
+        if value is None:
+            return cls(master=self._dialog)
+        return cls(master=self._dialog, value=value)
+
+    # ---------------- 各类控件 ----------------
+
+    def _build_simple(self, body: ttk.Frame, f: S.Field, current: Any,
+                      row: int, span: bool = False) -> None:
+        """
+        普通输入控件。
+
+        span=True 表示"占满整行"（标签已经在上一行）：先套一个 Frame
+        横跨所有列，里面的控件再自己排，这样"输入框 + 右边小按钮"
+        这种组合也摆得开。
+        """
+        key = f.key
+
+        if span:
+            holder = ttk.Frame(body)
+            holder.grid(row=row, column=0, columnspan=3, sticky='ew',
+                        padx=8, pady=(2, 0))
+            holder.columnconfigure(0, weight=1)
+            parent, grow = holder, 0
+        else:
+            parent, grow = body, row
+
+        first_col = 0 if span else 1
+        pad_right = 0 if span else 8
+
+        if f.kind == 'multiline':
+            w = tk.Text(parent, height=4, wrap='word', font=F_NORMAL,
+                        relief='solid', borderwidth=1)
+            w.insert('1.0', '' if current is None else str(current))
+            w.grid(row=grow, column=first_col,
+                   columnspan=2 if not span else 1,
+                   sticky='ew', pady=6, padx=(0, pad_right))
+            self._multiline[key] = w
+            self._widgets[key] = w
+            return
+
+        if f.kind == 'secret':
+            var = self._new_var('str', '' if current is None else str(current))
+            w = ttk.Entry(parent, textvariable=var, show='*', width=46, font=F_MONO)
+            w.grid(row=grow, column=first_col, sticky='ew',
+                   pady=6, padx=(0, 4 if span else 8))
+            ttk.Button(parent, text='👁', width=3,
+                       command=lambda e=w: e.configure(
+                           show='' if e.cget('show') else '*')).grid(
+                row=grow, column=first_col + 1, sticky='w')
+            self._vars[key] = var
+            self._widgets[key] = w
+            return
+
+        if f.kind == 'choice':
+            self._build_choice(parent, f, current, grow, span=span)
+            return
+
+        if f.kind in ('float', 'int'):
+            var = self._new_var('str', str(current if current is not None
+                                           else f.default))
+            w = ttk.Entry(parent, textvariable=var, width=14)
+            w.grid(row=grow, column=first_col, sticky='w', pady=6)
+            if f.kind == 'float':
+                ttk.Label(parent, text='秒', font=F_HINT,
+                          foreground=HINT_COLOR).grid(
+                    row=grow, column=first_col + 1, sticky='w', padx=4)
+            self._vars[key] = var
+            self._widgets[key] = w
+            return
+
+        # str
+        var = self._new_var('str', '' if current is None else str(current))
+        w = ttk.Entry(parent, textvariable=var, width=46)
+        w.grid(row=grow, column=first_col,
+               columnspan=2 if not span else 1,
+               sticky='ew', pady=6, padx=(0, pad_right))
+        self._vars[key] = var
+        self._widgets[key] = w
+
+    def _build_choice(self, body: ttk.Frame, f: S.Field, current: Any,
+                      row: int, span: bool = False) -> None:
+        # 全部是只读下拉。之前 llm.model 在这里开了可编辑模式（模型名允许
+        # 自己敲），后来用户要求模型彻底不要下拉框，它就改成 kind='str'
+        # 走普通文本框了（见 settings_schema.py），这条分支随之取消。
+        if f.key == 'mic_device':
+            choices = self._device_choices or [('系统默认', '')]
+        else:
+            choices = list(f.choices)
+
+        labels = [c[0] for c in choices]
+        mapping = {c[0]: c[1] for c in choices}
+        self._choice_maps[f.key] = mapping
+
+        var = self._new_var('str')
+        combo = ttk.Combobox(body, textvariable=var, values=labels, width=38,
+                             state='readonly')
+        shown = next((lbl for lbl, val in mapping.items() if val == current), None)
+        if shown is None:
+            shown = str(current) if current not in (None, '') else labels[0]
+        var.set(shown)
+        combo.grid(row=row, column=0 if span else 1, sticky='w', pady=6)
+
+        self._vars[f.key] = var
+        self._widgets[f.key] = combo
+
+        if f.key == 'mic_device':
+            ttk.Button(body, text='刷新设备', command=self._reload_devices).grid(
+                row=row, column=1 if span else 2, sticky='w', padx=4)
+
+    # ---------------- 快捷键编辑器 ----------------
+
+    def _build_shortcut_editor(self, body: ttk.Frame, current: Any, row: int) -> None:
+        container = ttk.Frame(body)
+        container.grid(row=row, column=1, columnspan=2, sticky='ew',
+                       pady=6, padx=(0, 8))
+
+        # 只留三列：按键 / 怎么触发 / 启用。
+        #
+        # 之前还暴露了「阻塞」和「类型」，两个都是实现细节：
+        #   - 阻塞(suppress)：按键要不要被程序吞掉。正常就该吞掉，
+        #     吞掉之后短按还会自动补发，所以 CapsLock 照样能切换大小写。
+        #     暴露给用户只会让人困惑，这里一律保持原值不动。
+        #   - 类型(keyboard/mouse)：看按键名就知道了，x1/x2 是鼠标，
+        #     其余是键盘。由 _key_to_type() 自动推导。
+        header = ttk.Frame(container)
+        header.pack(fill='x')
+        for txt, w in (('按一下这个键', 26), ('怎么触发', 26), ('启用', 6)):
+            ttk.Label(header, text=txt, font=F_HINT, foreground=HINT_COLOR,
+                      width=w).pack(side='left')
+
+        self._shortcut_holder = ttk.Frame(container)
+        self._shortcut_holder.pack(fill='x')
+
+        items = current if isinstance(current, list) else []
+        for sc in items:
+            if isinstance(sc, dict):
+                self._add_shortcut_row(sc)
+
+        buttons = ttk.Frame(container)
+        buttons.pack(fill='x', pady=(6, 0))
+        ttk.Button(buttons, text='＋ 添加', width=10,
+                   command=lambda: self._add_shortcut_row(
+                       {'key': 'f12', 'type': 'keyboard',
+                        'suppress': True, 'hold_mode': True, 'enabled': True})
+                   ).pack(side='left')
+        ttk.Button(buttons, text='－ 删除末行', width=12,
+                   command=self._remove_last_shortcut_row).pack(side='left', padx=6)
+
+        # 捕获结果 / 失败原因显示在这里。
+        # 不弹 messagebox：用户按错键是常事，弹窗要点一下才消失，很烦。
+        self._shortcut_status = ttk.Label(container, text='', font=F_HINT,
+                                          foreground=HINT_COLOR, wraplength=640,
+                                          justify='left')
+        self._shortcut_status.pack(fill='x', pady=(4, 0))
+
+    def _add_shortcut_row(self, sc: Dict[str, Any]) -> None:
+        holder = self._shortcut_holder
+        if holder is None:
+            return
+        r = len(self._shortcut_rows)
+
+        key_var = self._new_var('str', str(sc.get('key', 'f12')))
+        mode_var = self._new_var(
+            'str', MODE_HOLD if sc.get('hold_mode', True) else MODE_TOGGLE)
+        en_var = self._new_var('bool', bool(sc.get('enabled', True)))
+
+        row_frame = ttk.Frame(holder)
+        row_frame.pack(fill='x')
+
+        # 主路径：点一下，然后按下想用的键。
+        # 用 pynput 而不是 Tk 的 <KeyPress> —— 鼠标侧键和会被应用自己吞掉的
+        # CapsLock，Tk 那套都收不到。见 core/ui/key_capture.py。
+        key_btn = ttk.Button(row_frame, width=20,
+                             text=kc.key_label(key_var.get()))
+        key_btn.pack(side='left')
+
+        # 备用：极少数捕获不到的键（主要是 Esc —— 它被约定用来取消捕获）
+        menu_btn = ttk.Button(row_frame, width=2, text='▾')
+        menu_btn.pack(side='left', padx=(2, 10))
+
+        ttk.Combobox(row_frame, textvariable=mode_var, values=list(_SHORTCUT_MODES),
+                     width=24, state='readonly').pack(side='left', padx=(0, 10))
+
+        ttk.Checkbutton(row_frame, variable=en_var).pack(side='left')
+
+        row = {
+            'key': key_var,
+            'mode': mode_var,
+            # 保留原值，界面上不给改
+            'suppress': bool(sc.get('suppress', True)),
+            'rows': r,
+            'enabled': en_var,
+            'btn': key_btn,
+        }
+        self._shortcut_rows.append(row)
+
+        key_btn.configure(command=lambda _r=row: self._start_capture(_r))
+        menu_btn.configure(command=lambda _r=row, _b=menu_btn:
+                           self._show_key_menu(_r, _b))
+
+    def _show_key_menu(self, row: Dict[str, Any], anchor: tk.Misc) -> None:
+        """备用路径：从菜单里挑一个键（捕获不到 Esc 时用）。"""
+        menu = tk.Menu(self._dialog, tearoff=0)
+        groups = (
+            ('修饰键', ('caps_lock', 'num_lock', 'scroll_lock',
+                        'ctrl_l', 'ctrl_r', 'shift', 'shift_r',
+                        'alt_l', 'alt_gr', 'cmd', 'cmd_r')),
+            ('常见', ('space', 'enter', 'tab', 'backspace', 'delete', 'insert',
+                      'esc', 'home', 'end', 'page_up', 'page_down',
+                      'up', 'down', 'left', 'right',
+                      'print_screen', 'pause', 'menu')),
+            ('鼠标', ('x1', 'x2')),
+        )
+        for title, keys in groups:
+            sub = tk.Menu(menu, tearoff=0)
+            for k in keys:
+                sub.add_command(label=kc.key_label(k),
+                                command=lambda _k=k, _r=row: self._set_key(_r, _k))
+            menu.add_cascade(label=title, menu=sub)
+
+        sub_f = tk.Menu(menu, tearoff=0)
+        for k in (f'f{i}' for i in range(1, 25)):
+            sub_f.add_command(label=kc.key_label(k),
+                              command=lambda _k=k, _r=row: self._set_key(_r, _k))
+        menu.add_cascade(label='功能键 F1–F24', menu=sub_f)
+
+        sub_a = tk.Menu(menu, tearoff=0)
+        for k in 'abcdefghijklmnopqrstuvwxyz':
+            sub_a.add_command(label=k.upper(),
+                              command=lambda _k=k, _r=row: self._set_key(_r, _k))
+        menu.add_cascade(label='字母', menu=sub_a)
+
+        try:
+            menu.tk_popup(anchor.winfo_rootx(),
+                          anchor.winfo_rooty() + anchor.winfo_height())
+        finally:
+            menu.grab_release()
+
+    def _set_key(self, row: Dict[str, Any], key: str) -> None:
+        row['key'].set(key)
+        btn = row.get('btn')
+        if btn is not None:
+            try:
+                btn.configure(text=kc.key_label(key))
+            except Exception:
+                pass
+
+    # ---------------- 按一下键就捕获 ----------------
+
+    def _start_capture(self, row: Dict[str, Any]) -> None:
+        """
+        进入捕获态：用户按哪个键，就把这一行的按键设成哪个。
+
+        在**后台线程**里跑捕获（`capture_next_key` 是阻塞的），Tk 线程靠
+        `after` 轮询结果 —— 阻塞 Tk 线程的话界面会整个冻住（按钮上的
+        "请按下一个键…"都画不出来）。
+        """
+        if self._capturing_row is not None:
+            return                                   # 已经在捕获了，忽略重复点击
+        if self._key_capture is None:
+            self._set_status('按键捕获在这个环境里不可用，请用右边的 ▾ 手动选一个键。',
+                             warn=True)
+            return
+
+        self._capturing_row = row
+        self._capture_cancel = threading.Event()
+        self._capture_queue = queue.Queue()
+
+        btn = row.get('btn')
+        if btn is not None:
+            try:
+                btn.configure(text='请按下一个键…')
+            except Exception:
+                pass
+        self._set_status('现在按下你想用的那个键（鼠标侧键也可以）。'
+                         '按 Esc 取消，15 秒没按会自动放弃。')
+
+        # 捕获期间键盘焦点别留在输入框上 —— 否则按字母键会往框里打字
+        try:
+            self._dialog.focus_set()
+        except Exception:
+            pass
+
+        app_capture = self._key_capture
+        cancel = self._capture_cancel
+        box = self._capture_queue
+
+        def _work():
+            try:
+                res = app_capture(timeout=15.0, cancel=cancel)
+            except Exception as e:                    # 兜底，绝不让线程静默死掉
+                res = kc.CaptureResult(reason=f'按键捕获出错: {e}')
+            try:
+                box.put(res)
+            except Exception:
+                pass
+
+        threading.Thread(target=_work, daemon=True).start()
+        self._dialog.after(80, self._poll_capture)
+
+    def _poll_capture(self) -> None:
+        """Tk 线程这边轮询捕获结果。"""
+        row = self._capturing_row
+        if row is None:
+            return
+        try:
+            res = self._capture_queue.get_nowait()
+        except queue.Empty:
+            self._dialog.after(80, self._poll_capture)
+            return
+        self._finish_capture(row, res)
+
+    def _finish_capture(self, row: Dict[str, Any], res: Any) -> None:
+        self._capturing_row = None
+        cancelled_ev = self._capture_cancel
+        self._capture_cancel = None
+
+        if getattr(res, 'ok', False):
+            self._set_key(row, res.key)
+            self._set_status(f'已设为「{kc.key_label(res.key)}」。')
+            return
+
+        # 失败/取消/超时：按钮显示回原来的键
+        try:
+            row['btn'].configure(text=kc.key_label(row['key'].get()))
+        except Exception:
+            pass
+        reason = getattr(res, 'reason', '') or '没捕获到按键，再试一次。'
+        if cancelled_ev is not None and cancelled_ev.is_set():
+            self._set_status('已取消。')
+        else:
+            self._set_status(reason, warn=True)
+
+    def _cancel_capture(self) -> None:
+        """把正在进行的捕获叫停（Esc 或面板关闭时）。"""
+        if self._capture_cancel is not None:
+            try:
+                self._capture_cancel.set()
+            except Exception:
+                pass
+
+    def _on_escape(self, _event: Any = None) -> str:
+        """
+        Esc 的两义性：**正在捕获时它取消捕获**，否则还是关面板。
+
+        不这么做的话，用户想取消捕获反而把整个面板关了，
+        改了一半的设置全丢 —— 这是最招人烦的失败模式。
+        """
+        if self._capturing_row is not None:
+            self._cancel_capture()
+            row = self._capturing_row
+            try:
+                row['btn'].configure(text=kc.key_label(row['key'].get()))
+            except Exception:
+                pass
+            self._capturing_row = None
+            self._set_status('已取消。')
+            return 'break'                 # 别让 Esc 冒泡去关面板
+        self._on_cancel()
+        return 'break'
+
+    def _set_status(self, text: str, warn: bool = False) -> None:
+        if self._shortcut_status is None:
+            return
+        try:
+            self._shortcut_status.configure(
+                text=text, foreground=WARN_COLOR if warn else HINT_COLOR)
+        except Exception:
+            pass
+
+    def _remove_last_shortcut_row(self) -> None:
+        if not self._shortcut_rows or self._shortcut_holder is None:
+            return
+        gone = self._shortcut_rows.pop()
+        if gone is self._capturing_row:
+            self._cancel_capture()
+            self._capturing_row = None
+        children = self._shortcut_holder.winfo_children()
+        if children:
+            children[-1].destroy()
+
+    # ---------------- 麦克风 ----------------
+
+    def _reload_devices(self) -> None:
+        try:
+            from core.client.audio.device_select import list_input_devices
+            devices = [('系统默认', '')] + [
+                (f'{name}', name) for _idx, name, _ch in list_input_devices()
+            ]
+        except Exception:
+            messagebox.showwarning('刷新设备失败',
+                                   '无法枚举麦克风设备，请查看日志。',
+                                   parent=self._dialog)
+            return
+
+        self._device_choices = devices
+        mapping = {label: value for label, value in devices}
+        self._choice_maps['mic_device'] = mapping
+
+        combo = self._widgets.get('mic_device')
+        if isinstance(combo, ttk.Combobox):
+            current = mapping.get(self._vars['mic_device'].get(), '')
+            combo.configure(values=[label for label, _ in devices])
+            self._vars['mic_device'].set(
+                next((lbl for lbl, val in mapping.items() if val == current),
+                     devices[0][0]))
+
+    # ---------------- 角色切换 ----------------
+
+    def _switch_role(self) -> None:
+        """把当前控件里的角色字段值存进缓存，再载入新角色的值。"""
+        if self._role_var is None:
+            return
+        new_role = self._role_var.get()
+
+        # 1) 先把旧角色的当前值收进缓存
+        if self._current_role in self._role_cache:
+            for attr in self._role_cache[self._current_role]:
+                self._role_cache[self._current_role][attr] = self._read_role_widget(attr)
+
+        # 2) 载入新角色
+        self._current_role = new_role
+        self._role_cache.setdefault(new_role, {})
+        for attr in self._role_cache[new_role]:
+            self._write_role_widget(attr, self._role_cache[new_role][attr])
+
+    def _read_role_widget(self, attr: str) -> Any:
+        key = f'llm.{attr}'
+        var = self._vars.get(key)
+        field = S.find_field(key)
+        if var is None or field is None:      # 表里没有的字段原样保留
+            return self._role_cache.get(self._current_role, {}).get(attr)
+        raw = var.get()
+        if field.kind == 'bool':
+            return bool(raw)
+        if field.kind == 'choice':
+            mapping = self._choice_maps.get(key) or {}
+            return mapping.get(str(raw), raw)
+        return raw
+
+    def _write_role_widget(self, attr: str, value: Any) -> None:
+        key = f'llm.{attr}'
+        var = self._vars.get(key)
+        field = S.find_field(key)
+        if var is None or field is None:
+            return
+        if field.kind == 'bool':
+            var.set(bool(value))
+        elif field.kind == 'choice':
+            mapping = self._choice_maps.get(key) or {}
+            var.set(next((lbl for lbl, val in mapping.items() if val == value),
+                         str(value)))
+        else:
+            var.set('' if value is None else str(value))
+
+    # ---------------- 收集 ----------------
+
+    def _collect(self) -> Dict[str, Any]:
+        client: Dict[str, Any] = {}
+        llm_roles: Dict[str, Dict[str, Any]] = {}
+
+        for f in S.all_fields():
+            if f.key == 'shortcuts':
+                client['shortcuts'] = self._collect_shortcuts()
+                continue
+
+            if S.is_role_field(f.key):
+                continue        # 角色字段单独收集，见下
+
+            if f.key in self._multiline:
+                client[f.key] = self._multiline[f.key].get('1.0', 'end-1c')
+                continue
+
+            var = self._vars.get(f.key)
+            if var is None:
+                continue
+            raw = var.get()
+            if f.kind == 'choice':          # 下拉框里存的是显示名，要映射回真实值
+                mapping = self._choice_maps.get(f.key) or {}
+                raw = mapping.get(str(raw), raw)
+            client[f.key] = self._coerce(f, raw)
+
+        # 角色字段：先存当前编辑角色的最新值，再把全部角色的缓存吐出去
+        current = self._role_var.get() if self._role_var else self._current_role
+        for attr in self._role_cache.get(current, {}):
+            self._role_cache[current][attr] = self._read_role_widget(attr)
+        for name, values in self._role_cache.items():
+            if values:
+                llm_roles[name] = dict(values)
+
+        out: Dict[str, Any] = {'client': client, 'llm_roles': llm_roles}
+
+        # 「热词」页。返回 None 表示这一页没建出来 —— 那就**不能**往结果里
+        # 放热词，否则调用方会把"空内容"当成用户的意图，把 hot.txt 清掉。
+        hotwords = self._collect_hotwords()
+        if hotwords is not None:
+            out['hotwords'] = hotwords
+
+        return out
+
+    @staticmethod
+    def _coerce(f: S.Field, raw: Any) -> Any:
+        """把界面上的字符串转回正确类型。转不了就退回默认值。"""
+        if f.kind == 'bool':
+            return bool(raw)
+        if f.kind in ('int', 'float'):
+            try:
+                return int(float(str(raw).strip())) if f.kind == 'int' \
+                    else float(str(raw).strip())
+            except (TypeError, ValueError):
+                return f.default
+        if f.kind == 'choice':
+            return raw          # 已在 _collect 里通过 mapping 转过
+        return str(raw)
+
+    def _collect_shortcuts(self) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for row in self._shortcut_rows:
+            key = str(row['key'].get()).strip()
+            if not key:
+                continue
+            out.append({
+                'key': key,
+                # 类型由按键名推导；suppress 保留原值（界面上不暴露）
+                'type': _key_to_type(key),
+                'suppress': bool(row['suppress']),
+                'hold_mode': str(row['mode'].get()) == MODE_HOLD,
+                'enabled': bool(row['enabled'].get()),
+            })
+        return out
+
+    # ---------------- 按钮 ----------------
+
+    def _on_confirm(self) -> None:
+        self.result = DialogResult(confirmed=True, **self._collect())
+        self._close()
+
+    def _on_cancel(self) -> None:
+        self.result = DialogResult(confirmed=False)
+        self._close()
+
+    def _on_reset(self) -> None:
+        # 留个痕迹：这个按钮一旦确认就会把整个 config_local.json 改名备份掉，
+        # 用户改半天的东西全没了。排查"设置怎么不生效"时，这行日志是关键。
+        try:
+            from . import logger as _log
+            _log.info('用户点击了「恢复默认」按钮')
+        except Exception:
+            pass
+
+        if messagebox.askyesno(
+                '恢复默认',
+                '会删掉 config_local.json，所有设置回到程序自带的默认值。\n'
+                '需要重启客户端才生效。\n\n确定吗？',
+                parent=self._dialog):
+            self.result = DialogResult(confirmed=True, reset=True)
+            self._close()
+
+    def _close(self) -> None:
+        # 先把可能在跑的捕获叫停 —— 它跑在后台线程里，还会占着宿主的
+        # 快捷键监听。不叫停的话，用户关掉面板之后快捷键要等最多 15 秒
+        # （捕获超时）才会恢复，期间按什么键都没反应。
+        self._cancel_capture()
+        self._capturing_row = None
+
+        dlg = self._dialog
+        self._dialog = None
+        if dlg is not None:
+            try:
+                dlg.destroy()
+            except Exception:
+                pass
+        self._forget_tk_vars()
+
+    def _forget_tk_vars(self) -> None:
+        """
+        断开所有 Tk 变量到 Tcl 解释器的引用。
+
+        为什么必须做：这些变量绑在**别的线程**的 Tk 解释器上
+        （见 core/ui/settings_handler.py 的 SettingsDialogThread）。
+        要是不管它，等到解释器退出时主线程的 GC 会去跑
+        `tkinter.Variable.__del__`，而那个解释器正在 mainloop 里持着锁 ——
+        主线程就**永久卡死**。表现是：面板用着完全正常，但程序退不出去。
+
+        实测栈（py-spy）：
+            Thread XXX (idle)
+                __del__ (tkinter\\__init__.py:416)
+
+        把 `_tk` 置空之后 `__del__` 会直接 return，不再碰 Tcl。
+        此时窗口已经销毁，这些变量也不会再被用到。
+        """
+        for var in list(self._vars.values()):
+            self._detach_var(var)
+        for row in self._shortcut_rows:
+            for key in ('key', 'mode', 'enabled'):
+                self._detach_var(row.get(key))
+
+        self._hot_manual = None
+        self._hot_lint = None
+
+        self._vars.clear()
+        self._shortcut_rows.clear()
+        self._widgets.clear()
+        self._multiline.clear()
+        self._choice_maps.clear()
+
+    @staticmethod
+    def _detach_var(var: Any) -> None:
+        try:
+            if var is not None and getattr(var, '_tk', None) is not None:
+                var._tk = None
+        except Exception:
+            pass
+
+    # ---------------- 杂项 ----------------
+
+    @staticmethod
+    def _center(win: tk.Toplevel, width: int, height: int) -> None:
+        try:
+            win.update_idletasks()
+            sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+            width, height = min(width, sw - 40), min(height, sh - 80)
+            x, y = max(0, (sw - width) // 2), max(0, (sh - height) // 2 - 30)
+            win.geometry(f'{width}x{height}+{x}+{y}')
+            win.deiconify()
+            win.lift()
+            win.focus_force()
+        except Exception:
+            try:
+                win.deiconify()
+            except Exception:
+                pass
+
+
+def show_settings_dialog(snapshot: Dict[str, Any],
+                         parent: Optional[tk.Misc] = None) -> DialogResult:
+    """便捷入口，和 core/ui/context_dialog.py 的写法保持一致。"""
+    return SettingsDialog(parent).show(snapshot)

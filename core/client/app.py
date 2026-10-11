@@ -110,6 +110,24 @@ class CapsWriterClient:
         # 6. 停止事件循环（最后一步，确保前面的异步操作已调度）
         self.loop.stop()
 
+        # [补丁] 关掉录音浮层的 Tk 线程
+        try:
+            from core.ui.recording_overlay import stop_overlay
+            stop_overlay()
+        except Exception as _e:
+            logger.debug(f'关闭录音浮层时出错: {_e}')
+
+        # 7. [补丁] 把服务端一起收掉
+        #
+        # 服务端的托盘图标已经被补丁关掉了（config_local.PATCH_SERVER_DEFAULTS），
+        # 不在这里收掉的话它会变成一个看不见、却还占着 1.6GB 内存 / 1.7GB 显存
+        # 的孤儿进程，用户除了任务管理器没别的办法弄掉它。
+        try:
+            from .server_lifecycle import stop as _stop_server
+            _stop_server(timeout=5.0)
+        except Exception as _e:
+            logger.warning(f'停止服务端时出错（不影响客户端退出）: {_e}')
+
         logger.info("资源释放完成")
         console.print('[green4]再见！')
 
@@ -123,6 +141,44 @@ class CapsWriterClient:
 
         # 注册退出函数
         register_signal(self.stop)
+
+        # [补丁] 应用图标统一（core/ui/app_icon.py）：
+        #   ① 任务栏身份设成 SpeakMore.Client —— 不设的话 Windows 按**进程
+        #      可执行文件**归类，也就是 python.exe，任务栏会拿 Python 的图标
+        #      顶替，pin 到任务栏之后更是永远一个 Python 图标；
+        #   ② 黑窗口那个 python 图标换掉（托盘的「👁️ 显示/隐藏」会把它亮出来）。
+        # **必须在建任何窗口之前**，所以放在最前面。
+        try:
+            from core.ui.app_icon import apply_everything as _apply_icons
+            _apply_icons()
+        except Exception as _e:
+            logger.debug(f'应用图标设置失败（不影响使用）: {_e}')
+
+        # [补丁] 确保服务端在跑（不在就后台拉起来）
+        #
+        # 用异步版本：ResultProcessor.start() 本身就是每 2 秒重试的连接循环
+        # （result_processor.py:159-165），不需要在这里阻塞等端口就绪，
+        # 托盘图标也能立刻出现。
+        try:
+            from .server_lifecycle import ensure_async as _ensure_server_async
+            _ensure_server_async()
+        except Exception as _e:
+            logger.warning(f'自动拉起服务端失败（可手动启动服务端）: {_e}')
+
+        # [补丁] 录音状态浮层（屏幕下方那条跟着声音跳的波形）
+        try:
+            from core.ui.recording_overlay import start_overlay
+            start_overlay(self)
+        except Exception as _e:
+            logger.warning(f'录音浮层启动失败（不影响录音）: {_e}')
+
+        # [补丁] 第一次启动时弹首次设置向导（延迟几秒等托盘先出来）。
+        # 已经看过一次就不再弹，标记写在 config_local.json 的 meta.wizard_done。
+        try:
+            from core.ui.settings_handler import on_maybe_show_wizard
+            on_maybe_show_wizard(self)
+        except Exception as _e:
+            logger.warning(f'首次向导未能启动: {_e}')
 
         files = [Path(f) for f in sys.argv[1:] if os.path.exists(f)]
 

@@ -281,6 +281,27 @@ class ResultProcessor:
             self.state.set_output_text(text)
             broadcast_output_udp(text)
 
+        # [补丁] 把结果自动放一份到剪贴板。
+        #
+        # 上屏是直接打到光标处的，但用户常常还想把它粘到别的地方；
+        # 而且万一某个程序不吃模拟键盘输入，剪贴板还能手动 Ctrl+V 兜底。
+        # 托盘菜单的「📋 复制结果」本来就是干这个的，只是要手动点一下 ——
+        # 这里改成每次都自动放一份。
+        #
+        # 位置放在两条分支合流之后是有讲究的：
+        #   - 粘贴模式下 output() 的流程是"写剪贴板 → Ctrl+V → 还原旧内容"，
+        #     我们在这之后覆盖，剪贴板里留下的正好是识别结果；
+        #   - LLM 分支是 await 完的，此时 last_output_text 已经是润色后的最终文本。
+        if getattr(Config, 'copy_result_to_clipboard', True):
+            try:
+                from ..llm.llm_clipboard import copy_to_clipboard
+                final_text = self.state.last_output_text or text
+                if final_text:
+                    copy_to_clipboard(final_text)
+                    logger.debug(f'识别结果已复制到剪贴板（{len(final_text)} 字）')
+            except Exception as e:
+                logger.debug(f'复制结果到剪贴板失败（不影响上屏）: {e}')
+
         # 保存录音与写入 md 文件
         file_audio = None
         if Config.save_audio:

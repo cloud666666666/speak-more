@@ -209,11 +209,12 @@ def _create_icon(icon_path: Optional[str] = None):
 class _TraySystem:
     """托盘系统内部类"""
     
-    def __init__(self, name: Optional[str] = None, icon_path: Optional[str] = None, more_options: list = None):
+    def __init__(self, name: Optional[str] = None, icon_path: Optional[str] = None,
+                 more_options: list = None, default_option: Optional[str] = None):
         # 延迟导入 pystray
         import pystray
         from pystray import MenuItem as item
-        
+
         self.hwnd = _get_console_hwnd()
         self.should_exit = False
         self.title = name if name else (os.path.basename(sys.argv[0]) or "Console App")
@@ -223,15 +224,23 @@ class _TraySystem:
             _disable_close_button(self.hwnd)
 
         # 定义菜单
+        #
+        # [补丁] default_option 指定「左键单击托盘图标」触发哪一项。
+        # 作者原本把「显示/隐藏」设成 default=True，于是左键单击图标会把
+        # 隐藏的控制台窗口弹出来 —— 用户看到的就是一个莫名其妙的 cmd。
+        # 传了 default_option 就把它换成那一项（客户端传的是「⚙️ 设置」）；
+        # 不传则保持作者原行为。
         menu_items = [
             item(f"{self.title}", lambda: None, enabled=False),
-            item('👁️ 显示/隐藏', self.toggle_window, default=True),
+            item('👁️ 显示/隐藏', self.toggle_window,
+                 default=(default_option is None)),
         ]
 
         # 添加额外选项
         if more_options:
             for opt_name, opt_func in more_options:
-                menu_items.append(item(opt_name, opt_func))
+                menu_items.append(
+                    item(opt_name, opt_func, default=(opt_name == default_option)))
 
         menu_items.append(item('🔄 重启', self.on_restart))
         menu_items.append(item('❌ 退出', self.on_exit))
@@ -253,6 +262,25 @@ class _TraySystem:
         else:
             user32.ShowWindow(self.hwnd, SW_RESTORE)
             user32.SetForegroundWindow(self.hwnd)
+
+    def hide_window(self) -> None:
+        """
+        [补丁] 无条件隐藏控制台窗口。
+
+        为什么需要单独一个方法：作者在 start() 末尾调用的是 toggle_window()，
+        注释写着"启动即隐藏控制台窗口" —— 他假设控制台**启动时是可见的**，
+        所以"切换一下"正好等于"隐藏"。
+
+        但我们是用隐藏窗口样式（VBS 里 sh.Run(..., 0, ...)）启动的，
+        控制台一开始就是不可见的 —— toggle 反而会走 else 分支把它
+        **显示出来**。表现就是"程序跑着跑着突然冒出一个 cmd 黑框"。
+        """
+        if not self.hwnd or user32 is None:
+            return
+        try:
+            user32.ShowWindow(self.hwnd, SW_HIDE)
+        except Exception as e:
+            logger.debug(f'隐藏控制台窗口失败: {e}')
 
     def monitor_loop(self) -> None:
         """监控线程：检测最小化操作"""
@@ -329,11 +357,18 @@ class _TraySystem:
         t_monitor = threading.Thread(target=self.monitor_loop, daemon=True)
         t_monitor.start()
 
-        # 启动时隐藏窗口
-        self.toggle_window()
+        # [补丁] 启动时**无条件隐藏**窗口。
+        #
+        # 作者原本写的是 self.toggle_window()，注释是"启动时隐藏窗口" ——
+        # 他假设控制台启动时是可见的。但我们用隐藏窗口样式启动
+        # （启动脚本里 sh.Run(..., 0, ...)），控制台一开始就不可见，
+        # toggle 会走 else 分支把它**显示出来**。
+        self.hide_window()
 
 
-def enable_min_to_tray(name: Optional[str] = None, icon_path: Optional[str] = None, exit_callback=None, more_options: list = None) -> None:
+def enable_min_to_tray(name: Optional[str] = None, icon_path: Optional[str] = None,
+                       exit_callback=None, more_options: list = None,
+                       default_option: Optional[str] = None) -> None:
     """
     启用最小化到托盘功能
 
@@ -345,6 +380,8 @@ def enable_min_to_tray(name: Optional[str] = None, icon_path: Optional[str] = No
         icon_path: 图标文件路径，默认动态生成
         exit_callback: 退出回调函数，当用户点击托盘退出菜单时调用
         more_options: 额外菜单项列表，格式为 [(名称, 回调函数), ...]
+        default_option: [补丁] 左键单击托盘图标时触发哪一项（按菜单文字匹配）。
+                        不传则沿用作者行为 —— 左键弹出隐藏的控制台窗口。
     """
     global _tray_instance
 
@@ -373,7 +410,7 @@ def enable_min_to_tray(name: Optional[str] = None, icon_path: Optional[str] = No
         if not _get_console_hwnd():
             return  # 没有控制台窗口
 
-        _tray_instance = _TraySystem(name, icon_path, more_options)
+        _tray_instance = _TraySystem(name, icon_path, more_options, default_option)
         _tray_instance.start()
 
 

@@ -31,18 +31,32 @@ class TrayManager:
         icon_path = os.path.join(self.app.base_dir, 'assets', 'icon.ico')
         
         # 启用托盘
+        # [补丁] 应用对外显示名（本分发版叫 Speak More）
+        try:
+            from core.branding import TRAY_TITLE as _tray_title
+        except Exception:
+            _tray_title = 'CapsWriter Client'
+
         enable_min_to_tray(
-            'CapsWriter Client',
+            _tray_title,
             icon_path,
             exit_callback=self.app.stop,
             more_options=[
+                # [补丁] 图形设置面板。放在最前面是因为它是最常用的入口
+                ('⚙️ 设置', self._open_settings),
                 ('📋 复制结果', self._copy_last_result),
                 ('📁 日记', self._open_diary),
                 ('📝 上下文', self._add_context),
                 ('✨ 热词', self._add_hotword),
                 ('🧹 清除记忆', self._clear_memory),
                 ('♻️ 重开音频', self._restart_audio),
-            ]
+                # [补丁] 服务端的托盘图标已关掉，控制项并到这里来
+                ('🔌 重启服务端', self._restart_server),
+            ],
+            # [补丁] 左键单击托盘图标 -> 打开设置面板。
+            # 作者原本把「显示/隐藏」设成默认动作，左键单击会把隐藏的
+            # 控制台窗口弹出来，用户看到的是一个莫名其妙的 cmd 黑框。
+            default_option='⚙️ 设置',
         )
         logger.info("托盘图标已启用")
 
@@ -58,6 +72,45 @@ class TrayManager:
         except Exception as e:
             logger.debug(f"TrayManager: 卸载托盘时发生错误: {e}")
 
+    def _open_settings(self):
+        """
+        [补丁] 打开图形设置面板
+
+        注意：本回调**运行在 pystray 的消息线程**上。on_open_settings()
+        内部只会起一个 worker 线程就立刻返回，所以这里不会卡住托盘菜单
+        （作者原有的 _add_context 是直接在托盘线程里等对话框结果的，
+        面板开着的时候托盘会整个点不动，所以我们没那么做）。
+        """
+        try:
+            from core.ui.settings_handler import on_open_settings
+            on_open_settings(self.app)
+        except Exception as e:
+            logger.error(f"打开设置面板失败: {e}", exc_info=True)
+
+    def _restart_server(self):
+        """
+        [补丁] 重启识别服务端
+
+        服务端自己的托盘图标已经被补丁关掉了（config_local 的
+        PATCH_SERVER_DEFAULTS），所以它的生命周期控制都并到客户端菜单里：
+        客户端负责在启动时拉起它、退出时收掉它，这里负责手动重启。
+
+        异步执行 —— 服务端要重新加载模型（约 5~10 秒），
+        不能把 pystray 的消息线程卡住。
+        """
+        try:
+            from ..server_lifecycle import restart_async
+
+            from ..ui import toast
+            # 用收窄的小提示条。作者那套 toast 默认 initial_width=0.5，
+            # 占屏幕宽度一半、还配饱和蓝色，弹出来太扎眼（用户反馈过"不美观"）。
+            toast('正在重启服务端…（重新加载模型约需 10 秒）',
+                  font_size=11, duration=5000, bg='#2B3440', initial_width=0.28)
+            restart_async()
+            logger.info("用户从托盘请求重启服务端")
+        except Exception as e:
+            logger.error(f"重启服务端失败: {e}", exc_info=True)
+
     def _restart_audio(self):
         """重启音频流回调"""
         if hasattr(self.app, 'stream') and self.app.stream:
@@ -69,7 +122,8 @@ class TrayManager:
         from ..ui import toast
         if self.app.llm:
             self.app.llm.clear_history()
-            toast("清除成功：已清除所有角色的对话历史记录", duration=3000, bg="#075077")
+            toast("清除成功：已清除所有角色的对话历史记录",
+                  font_size=11, duration=3000, bg='#2B3440', initial_width=0.28)
 
     def _open_diary(self):
         """用系统默认方式打开当月日记文件夹回调"""

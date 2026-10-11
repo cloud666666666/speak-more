@@ -165,6 +165,10 @@ class ToastWindowBase(ABC):
         self.window.bind('<Button-4>', self._on_mouse_wheel)  # Linux 向上滚动
         self.window.bind('<Button-5>', self._on_mouse_wheel)  # Linux 向下滚动
         self.window.bind('<Control-c>', self._on_copy)        # Ctrl+C 复制
+        # [补丁] 双击关闭。原本这个无边框窗口既没有关闭按钮，Escape 又因为
+        # 窗口拿不到焦点基本按不动，想提前关掉只能干等定时器走完。
+        # 用双击而不是单击，是因为单击已经绑给拖拽了。
+        self.window.bind('<Double-Button-1>', self._destroy_window)
 
     def _calculate_actual_width(self) -> int:
         """计算实际窗口宽度

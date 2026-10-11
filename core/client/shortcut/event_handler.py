@@ -38,23 +38,30 @@ class ShortcutEventHandler:
                 task.launch()
             return
 
-        # 单击模式
-        if task.released:
-            from threading import Event
-            task.pressed = True
-            task.released = False
-            task.event = Event()  # 创建新事件对象
-            self.pool.submit(self._count_down, task)
-            self.pool.submit(self._manage_task, task)
+        # [补丁] 单击模式：点一下开始，再点一下结束。
+        #
+        # 作者原本要走 _count_down / _manage_task 那套阈值判定，但那里有个
+        # 逻辑错误：_count_down 要等 threshold(0.3s) 才 set event，
+        # 而 _manage_task 只等 threshold*0.8(0.24s) —— 事件永远等不到，
+        # 于是第一次按下总是走 else 分支被 task.cancel() 掉。
+        #
+        # 结果就是：**必须按住超过 0.3 秒**才算开始录音，轻轻点一下什么都不发生。
+        # 而用户对"点一下开始"的预期就是轻轻点一下 —— 点了没反应，自然
+        # 就以为这个模式坏了、只能用长按。
+        #
+        # 改成直白的开关语义：没在录音时按下就开始（松手不停），
+        # 正在录音时按下就结束并上屏。
+        if task.is_recording:
+            task.finish()
+        else:
+            task.launch()
 
     def handle_keyup(self, key_name, task) -> None:
         """处理按键释放事件"""
-        # 单击模式
+        # 单击模式：开/关都已经在 handle_keydown 里决定了，松手不做任何事
         if not task.shortcut.hold_mode:
-            if task.pressed:
-                task.pressed = False
-                task.released = True
-                task.event.set()
+            task.pressed = False
+            task.released = True
             return
 
         # 长按模式

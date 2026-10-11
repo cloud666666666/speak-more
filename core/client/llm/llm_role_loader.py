@@ -46,6 +46,24 @@ class RoleLoader:
         # 空字符串和「默认」都表示默认角色
         role_name = role_config.display_name or RoleConfig.DEFAULT_ROLE_NAME
 
+        # [补丁] 套用 config_local.json 里 llm_roles[<角色名>] 的覆盖
+        # （api_key / model / enabled ...，由 ⚙️ 设置面板写入）
+        #
+        # 注入点选在 register_role() 而不是 LLMHandler.reload_roles() 末尾：
+        # 这里是所有加载路径的收口点（load_all_roles / reload_role /
+        # watcher 的全量重载都走它）。放到 reload_roles() 末尾的话，
+        # LLMFileWatcher 每 3 秒的防抖重载会把面板里填的 key 冲掉，
+        # 用户会看到"我填的 key 过几秒又没了"。
+        try:
+            from config_local import (
+                apply_patch_role_defaults as _apply_patch_role_defaults,
+                apply_role_overrides as _apply_role_overrides,
+            )
+            _apply_patch_role_defaults(role_name, role_config)   # 先套补丁默认值
+            _apply_role_overrides(role_name, role_config)        # 再让用户的 JSON 盖过它
+        except Exception:
+            pass
+
         self.roles_registry[role_name] = role_config
 
         return role_name
