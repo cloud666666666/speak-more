@@ -38,7 +38,7 @@
 目前是**源码部署**（上游的官方发行版是打包好的 exe，这一版暂时跟进源码）：
 
 ```bash
-git clone https://github.com/cloud666666666/<本仓库> speak-more
+git clone https://github.com/cloud666666666/speak-more speak-more
 cd speak-more
 uv sync              # 或 pip install -r 依赖
 python start_client.py
