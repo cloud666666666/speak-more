@@ -21,6 +21,17 @@ from config_server import ServerConfig as Config, __version__
 setup_logger('server', level=Config.log_level)
 logger = get_logger('server')
 
+# [补丁] 补打显卡探测结论。
+# 探测发生在上面那句 import config_server 的模块体里，那时 logger 还没建好，
+# 打日志会丢，所以只能在这里补一行（探测结果由 gpu_probe 暂存）。
+try:
+    from core.tools import gpu_probe as _gpu_probe
+    _gpu_decision = _gpu_probe.last_decision()
+    if _gpu_decision:
+        logger.info(_gpu_probe.summary_line(_gpu_decision))
+except Exception:
+    pass
+
 from core.server.schema import Task, Result
 
 __all__ = [

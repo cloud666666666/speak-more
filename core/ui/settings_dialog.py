@@ -411,6 +411,16 @@ class SettingsDialog:
                 padx=8, pady=(0, 14))
             row += 1
 
+        # [补丁] 显卡与推理后端：服务端启动时探测一次，写进 logs/gpu_probe.json，
+        # 这里读出来展示 —— 用户想知道"到底有没有用上显卡"时不用去翻日志。
+        gpu_line = self._gpu_summary()
+        if gpu_line:
+            ttk.Label(body, text=gpu_line, font=F_HINT, foreground=HINT_COLOR,
+                      wraplength=740, justify='left').grid(
+                row=row, column=0, columnspan=3, sticky='w',
+                padx=8, pady=(0, 14))
+            row += 1
+
         ttk.Separator(body, orient='horizontal').grid(
             row=row, column=0, columnspan=3, sticky='ew', padx=8, pady=(4, 12))
         row += 1
@@ -466,6 +476,51 @@ class SettingsDialog:
             os.startfile(str(path))            # noqa: S606 (Windows only)
         except Exception as e:
             logger.debug(f'打开目录失败 {path}: {e}')
+
+    @staticmethod
+    def _gpu_summary() -> str:
+        """
+        [补丁] 把服务端探测到的显卡与推理后端摘要成一行。
+
+        数据来自 logs/gpu_probe.json —— 服务端启动时由 core/tools/gpu_probe.py
+        写入（探测 + 自动选择后端）。读不到（服务端还没跑过）就返回空串，
+        界面不显示这一行。
+        """
+        import json
+        path = Path(REPO_ROOT) / 'logs' / 'gpu_probe.json'
+        try:
+            data = json.loads(path.read_text(encoding='utf-8'))
+        except Exception:
+            return ''
+        decision = data.get('decision') or {}
+        if not decision or decision.get('error'):
+            return ''
+
+        names = [g.get('name', '') for g in (data.get('gpus') or [])
+                 if not g.get('virtual') and g.get('name')]
+        hardware = '、'.join(names[:3]) if names else '未识别到物理显卡'
+        if len(names) > 3:
+            hardware += f' 等 {len(names)} 块'
+
+        if decision.get('disabled'):
+            return f'硬件：{hardware}　（显卡自动选择已关闭，当前按配置里的固定值跑）'
+
+        onnx = decision.get('onnx_provider') or '?'
+        onnx_by = '自动' if decision.get('onnx_source') == '自动' else '指定'
+        llm = '用显卡' if decision.get('llm_use_gpu') else '用 CPU'
+        backend = decision.get('llama_backend') or '?'
+        text = (f'硬件：{hardware}\n'
+                f'推理后端：ONNX 编码器 {onnx}（{onnx_by}）　'
+                f'GGUF 解码器 {llm}（llama.cpp {backend}）\n'
+                f'想强制改用 CPU：在 config_local.json 的 server 段写 '
+                f'{{"gpu_auto": false, "onnx_provider": "cpu"}}，重启服务端生效。')
+        # 有后端"装了但用不起来"时，把原因也显示出来 —— 否则用户只会觉得"怎么这么慢"
+        rejected = decision.get('rejected') or []
+        if rejected:
+            names_r = '、'.join(p.replace('ExecutionProvider', '') for p in rejected)
+            text += (f'\n注意：{names_r} 被 onnxruntime 报告为可用，但实际会静默回落到 CPU'
+                     f'（依赖没装全或版本不匹配），已跳过。')
+        return text
 
     # ---------------- 「热词」页 ----------------
 

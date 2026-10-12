@@ -206,3 +206,28 @@ except Exception as _e:
     except Exception:
         pass
 
+
+# ============================================================
+#  [补丁] 显卡探测：机器上有能用的显卡时，优先把推理放到显卡上跑（降低延迟）
+#
+#  为什么放在文件末尾：EngineFactory.create_asr_engine 是在**构造引擎那一刻**
+#  把 Qwen3ASRGGUFArgs 这类类的属性整体读走的，所以只要在引擎创建之前把值写好
+#  就行。而 config_server 的模块体在 worker 子进程里会重新执行一遍（spawn 出来的
+#  全新解释器），于是主进程与 worker 各自探测、各自生效。
+#
+#  开关写在 config_local.json 的 server 段：
+#      {"server": {"gpu_auto": true, "onnx_provider": "auto", "llm_use_gpu": "auto"}}
+#  想强制用 CPU 排障：{"server": {"gpu_auto": false, "onnx_provider": "cpu"}}
+#
+#  注意：这里**故意不打日志** —— 此刻 core/server/__init__.py 还没执行到
+#  setup_logger，logger 没有 handler，打出去就丢了。探测结果先放在
+#  gpu_probe.last_decision()，由 core/server/__init__.py 在 setup 之后补打一行，
+#  同时也会写进 logs/gpu_probe.json 供界面读取。
+# ============================================================
+try:
+    from core.tools import gpu_probe as _gpu_probe
+    _gpu_probe.auto_configure(ServerConfig)
+except Exception:
+    # 探测失败绝不能拖垮服务端启动，各引擎保留类里写死的默认值即可
+    pass
+
