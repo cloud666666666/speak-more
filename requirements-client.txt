@@ -10,6 +10,9 @@ pynput
 pyclip
 sounddevice
 watchdog
+psutil          # 服务端生命周期托管（core/client/server_lifecycle.py）依赖它，
+                # 缺了会让「自动拉起/退出收掉/看门狗」整链静默失效
+pywin32         # core/tools/window_detector.py 用 win32gui/win32process 取前台窗口
 
 # network and api 
 websockets

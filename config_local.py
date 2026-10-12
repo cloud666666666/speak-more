@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sys
 import threading
 import traceback
 from datetime import datetime
@@ -34,7 +35,14 @@ from typing import Any, Dict, List, Optional
 PATCH_VERSION = '0.1.0'
 SCHEMA_VERSION = 1
 
-_ROOT = Path(__file__).resolve().parent
+# 打包（PyInstaller）后 __file__ 可能指向 bundle 内部（internal/），
+# 那样 config_local.json 会写进用户看不到、也改不了的地方。冻结形态下
+# 一律用 exe 所在目录（start_client.exe / start_server.exe 同级），
+# 保证「删掉根目录的 config_local.json 即可恢复出厂」这句话在打包版也成立。
+if getattr(sys, 'frozen', False):
+    _ROOT = Path(sys.executable).resolve().parent
+else:
+    _ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = _ROOT / 'config_local.json'
 _ERROR_LOG = _ROOT / 'logs' / 'config_local_error.log'
 _PATCH_LOG = _ROOT / 'logs' / 'patch_status.log'
@@ -48,7 +56,13 @@ EXTRA_CLIENT_DEFAULTS: Dict[str, Any] = {
     'show_recording_overlay': True,  # 录音时是否显示屏幕下方的波形浮层
     'copy_result_to_clipboard': True,  # 识别结果自动放一份进剪贴板
 }
-EXTRA_SERVER_DEFAULTS: Dict[str, Any] = {}
+EXTRA_SERVER_DEFAULTS: Dict[str, Any] = {
+    # 显卡探测（实现见 core/tools/gpu_probe.py）：
+    # 有能用的显卡时优先把推理放到显卡上跑，降低单句延迟。
+    'gpu_auto': True,           # 总开关；关掉则完全按下面两项的显式值来
+    'onnx_provider': 'auto',    # ONNX 编码器后端：auto / cpu / dml / cuda / trt
+    'llm_use_gpu': 'auto',      # GGUF 解码器是否用显卡：auto / true / false
+}
 
 # 补丁自己的服务端默认值：**先套这些，再让 config_local.json 的覆盖盖上去**，
 # 所以用户想改回来只需在 JSON 里显式写 server.enable_tray = true。
@@ -165,6 +179,7 @@ _META_PREFIX = '$'
 _VALID_LOG_LEVELS = frozenset({'DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'})
 _VALID_SHORTCUT_TYPES = frozenset({'keyboard', 'mouse'})
 _VALID_LOCALES = frozenset({'zh-hant', 'zh-tw', 'zh-hk'})
+_VALID_ONNX_PROVIDERS = frozenset({'auto', 'cpu', 'dml', 'directml', 'cuda', 'trt', 'tensorrt'})
 
 # 允许被 config_local.json 覆盖的 LLM 角色字段（其余字段忽略，防止改坏角色对象）
 _ROLE_WRITABLE_FIELDS = frozenset({
@@ -416,6 +431,23 @@ def _validate(key: str, value: Any) -> Optional[str]:
         if value < 0 or (key.endswith('duration') and value == 0):
             return '分段时长必须为正数'
         return None
+
+    if key == 'gpu_auto':
+        if not isinstance(value, bool):
+            return 'gpu_auto 必须是布尔值'
+        return None
+
+    if key == 'onnx_provider':
+        if not isinstance(value, str) or value.strip().lower() not in _VALID_ONNX_PROVIDERS:
+            return f"onnx_provider 必须是 {'/'.join(sorted(_VALID_ONNX_PROVIDERS))} 之一"
+        return None
+
+    if key == 'llm_use_gpu':
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, str) and value.strip().lower() in ('auto', 'true', 'false'):
+            return None
+        return 'llm_use_gpu 必须是 auto / true / false'
 
     if key == 'log_level':
         if not isinstance(value, str) or value.upper() not in _VALID_LOG_LEVELS:

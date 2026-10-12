@@ -117,7 +117,7 @@ a_2.binaries = filtered_binaries
 
 
 # 排除不要打包的模块（这些将作为源文件复制）
-private_module = ['core', 'config_client', 'config_server', 'LLM', ]
+private_module = ['core', 'config_client', 'config_server', 'LLM', 'config_local', ]
 
 for which in (a_2,):
     filtered = []
@@ -147,7 +147,7 @@ exe_2 = EXE(
     a_2.scripts,
     [],
     exclude_binaries=True,
-    name='start_client',
+    name='Speak More',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -171,18 +171,20 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='CapsWriter-Offline-Client',
+    name='Speak More Client',
 )
 
 
 # 复制额外所需的文件（只复制用户自己写的文件）
 my_files = [
     'config_client.py',
-    'core_client.py',
+    'config_local.py',      # 本地配置覆盖层：config_client 在模块级 import 它，
+    'autostart.py',         # 不放进根目录就只能以 .pyc 躺在 internal/ 里，用户改不了
     'hot.txt',
     'hot-server.txt',
     'hot-rule.txt',
-    'readme.md'
+    'readme.md',
+    'LICENSE'               # MIT 要求随发行物附带版权与许可原文，上游这份清单漏了
 ]
 my_folders = []     # 使用软链接，不再复制
 dest_root = join('dist', basename(coll.name))
@@ -214,7 +216,8 @@ from platform import system
 from subprocess import run
 
 if system() == 'Windows':
-    link_folders = ['assets', 'core', 'LLM', 'docs', 'log']
+    # 同 build.spec：不链 logs，避免把构建机的日志打进发行包
+    link_folders = ['assets', 'core', 'LLM', 'docs']
     for folder in link_folders:
         if not exists(folder):
             continue
