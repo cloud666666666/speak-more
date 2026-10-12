@@ -39,53 +39,11 @@ class ServerConfig:
 
 
 
-class ModelDownloadLinks:
-    """模型下载链接配置"""
-    # 统一导向 GitHub Release 模型页面
-    models_page = "https://github.com/HaujetZhao/CapsWriter-Offline/releases/tag/models"
-
-
-class ModelPaths:
-    """模型文件路径配置"""
-
-    # 基础目录
-    model_dir = Path() / 'models'
-
-    # Paraformer 模型路径
-    paraformer_dir = model_dir / 'Paraformer' / "speech_paraformer-large-vad-punc_asr_nat-zh-cn-16k-common-vocab8404-onnx"
-    paraformer_model = paraformer_dir / 'model.onnx'
-    paraformer_tokens = paraformer_dir / 'tokens.txt'
-
-    # 标点模型路径
-    punc_model_dir = model_dir / 'Punct-CT-Transformer' / 'sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12' / 'model.onnx'
-
-    # SenseVoice 模型路径，自带标点
-    sensevoice_dir = model_dir / 'SenseVoice-Small' / 'Sensevoice-Small-ONNX'
-    sensevoice_encoder = sensevoice_dir / 'SenseVoice-Encoder.fp16.onnx'
-    sensevoice_decoder = sensevoice_dir / 'SenseVoice-CTC.fp16.onnx'
-    sensevoice_tokenizer = sensevoice_dir / 'tokenizer.bpe.model'
-
-
-    # Fun-ASR-Nano 模型路径，自带标点
-    fun_asr_nano_gguf_dir = model_dir / 'Fun-ASR-Nano' / 'Fun-ASR-Nano-GGUF'
-    fun_asr_nano_gguf_encoder_adaptor = fun_asr_nano_gguf_dir / 'Fun-ASR-Nano-Encoder-Adaptor.fp16.onnx'
-    fun_asr_nano_gguf_ctc = fun_asr_nano_gguf_dir / 'Fun-ASR-Nano-CTC.fp16.onnx'
-    fun_asr_nano_gguf_llm_decode = fun_asr_nano_gguf_dir / 'Fun-ASR-Nano-Decoder.q5_k.gguf'
-    fun_asr_nano_gguf_token = fun_asr_nano_gguf_dir / 'tokens.txt'
-    fun_asr_nano_gguf_hotwords = Path() / 'hot-server.txt'
-
-    # Qwen3-ASR 模型路径，自带标点
-    qwen3_asr_gguf_dir = model_dir / 'Qwen3-ASR' / 'Qwen3-ASR-1.7B'
-    qwen3_asr_gguf_encoder_frontend = qwen3_asr_gguf_dir / 'qwen3_asr_encoder_frontend.onnx'
-    qwen3_asr_gguf_encoder_backend = qwen3_asr_gguf_dir / 'qwen3_asr_encoder_backend.onnx'
-    qwen3_asr_gguf_llm_decode = qwen3_asr_gguf_dir / 'qwen3_asr_llm.gguf'
-
-    # Force-Aligner 模型路径
-    force_aligner_gguf_dir = model_dir / 'Qwen3-ForcedAligner' / 'Qwen3-ForcedAligner-0.6B'
-    force_aligner_gguf_encoder_frontend = force_aligner_gguf_dir / 'qwen3_aligner_encoder_frontend.int4.onnx'
-    force_aligner_gguf_encoder_backend = force_aligner_gguf_dir / 'qwen3_aligner_encoder_backend.int4.onnx'
-    force_aligner_gguf_llm_decode = force_aligner_gguf_dir / 'qwen3_aligner_llm.q5_k.gguf'
-
+# 模型与 DLL 的路径表已挪到 core/tools/model_paths.py —— 客户端启动时要检查
+# 「模型/DLL 齐不齐」，而客户端不能 import 本模块（那会在客户端进程里连带跑一遍
+# 显卡探测、建 ONNX 会话）。这里转出来，各处 `from config_server import ModelPaths`
+# 照常可用。
+from core.tools.model_paths import ModelPaths, ModelDownloadLinks  # noqa: F401
 
 
 class ParaformerArgs:
