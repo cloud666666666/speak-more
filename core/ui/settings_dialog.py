@@ -424,6 +424,16 @@ class SettingsDialog:
                 padx=8, pady=(0, 14))
             row += 1
 
+        # [补丁] 自检：模型与推理库齐不齐（现场检查，所以永远是最新的）
+        model_text, model_ok = self._model_summary()
+        if model_text:
+            ttk.Label(body, text=model_text, font=F_HINT,
+                      foreground=HINT_COLOR if model_ok else WARN_COLOR,
+                      wraplength=740, justify='left').grid(
+                row=row, column=0, columnspan=3, sticky='w',
+                padx=8, pady=(0, 14))
+            row += 1
+
         ttk.Separator(body, orient='horizontal').grid(
             row=row, column=0, columnspan=3, sticky='ew', padx=8, pady=(4, 12))
         row += 1
@@ -524,6 +534,27 @@ class SettingsDialog:
             text += (f'\n注意：{names_r} 被 onnxruntime 报告为可用，但实际会静默回落到 CPU'
                      f'（依赖没装全或版本不匹配），已跳过。')
         return text
+
+    @staticmethod
+    def _model_summary() -> tuple:
+        """
+        [补丁] 自检结果：(文案, 是否正常)。
+
+        现场检查（只做文件存在性判断，很便宜），所以界面里显示的永远是最新状态 ——
+        用户按了 CapsLock 没反应时，打开这里就能看到是不是缺文件。
+        """
+        try:
+            from core.client.model_precheck import ENGINE_NAMES, format_lines, run_precheck
+            report = run_precheck()
+        except Exception:
+            return '', True
+
+        if report.ok:
+            name = ENGINE_NAMES.get(report.model_type, report.model_type)
+            return f'自检：模型与推理库齐备（{name}）', True
+
+        lines = format_lines(report)
+        return '自检发现问题：\n' + '\n'.join(lines[:6]), False
 
     # ---------------- 「热词」页 ----------------
 

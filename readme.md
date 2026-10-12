@@ -51,10 +51,18 @@ python start_client.py
 
 还需要两样上游要求的东西（仓库里不带）：
 
-- **llama.cpp 的 DLL**：铺到 `core/server/engines/llama/bin/`、
-  `core/server/engines/qwen_asr_gguf/inference/bin/`、
-  `core/server/engines/fun_asr_gguf/inference/bin/` 三个目录（少一个就起不来）
-- **模型**：放到 `models/` 下，结构见 `config_server.py` 的 `ModelPaths`
+- **llama.cpp 的 DLL**（`ggml.dll` / `ggml-base.dll` / `llama.dll` 加后端 DLL）：
+  每个引擎从**自己的** `inference/bin` 加载，中间没有回退路径 ——
+  - 用默认引擎（Qwen3-ASR）：铺到 `core/server/engines/qwen_asr_gguf/inference/bin/`
+  - 用 Fun-ASR-Nano：铺到 `core/server/engines/fun_asr_gguf/inference/bin/`
+  - 要文件转录（需要时间戳对齐）：再铺一份到
+    `core/server/engines/force_aligner_gguf/inference/bin/`
+
+  （`core/server/engines/llama/bin/` 是历史遗留目录，现在的引擎已经不用它了）
+  版本与下载地址见各目录里的 `llama.cpp二进制下载到这里.txt`（本仓库用 b10621）
+
+- **模型**：放到 `models/` 下，结构见 `config_server.py` 的 `ModelPaths`。
+  缺哪个文件，**客户端启动时会直接弹窗告诉你**（缺哪个文件、该放哪、去哪下）
 
 ## 许可
 

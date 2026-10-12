@@ -215,6 +215,18 @@ class CapsWriterClient:
         except Exception as _e:
             logger.debug(f'应用图标设置失败（不影响使用）: {_e}')
 
+        # [补丁] 启动预检：模型与 llama.cpp 运行库齐不齐。
+        #
+        # 为什么必须在这里说清楚：服务端是被我们用隐藏控制台 + stdin=DEVNULL
+        # 拉起来的，缺模型时它只会静默退出（日志一行、界面什么都没有），
+        # 用户的体验是"双击了、托盘也在、按住 CapsLock 毫无反应"。
+        # 放在拉起服务端之前 —— 先告诉用户为什么，再让服务端去撞墙。
+        try:
+            from .model_precheck import run_precheck, notify_if_problems
+            notify_if_problems(run_precheck(self.base_dir), logger)
+        except Exception as _e:
+            logger.debug(f'启动预检失败（不影响启动）: {_e}')
+
         # [补丁] 确保服务端在跑（不在就后台拉起来）
         #
         # 用异步版本：ResultProcessor.start() 本身就是每 2 秒重试的连接循环
