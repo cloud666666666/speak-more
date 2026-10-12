@@ -36,6 +36,60 @@ from core.tools.empty_working_set import empty_current_working_set
 from platform import system
 
 
+# 单实例互斥体句柄。必须留一个模块级引用持有到进程结束 ——
+# 一旦被 GC 关掉，互斥体就释放了，后面的实例又能进来。
+_SINGLETON_MUTEX = None
+
+
+def _acquire_single_instance(name: str = 'SpeakMore.Client.Singleton') -> bool:
+    """
+    [补丁] 单实例保护：返回 True 表示本进程拿到了锁，False 表示已有一个在跑。
+
+    为什么需要：客户端会注册全局键盘/鼠标钩子（默认 CapsLock + 鼠标侧键）。
+    双击两次图标就是两份钩子抢同一个键 —— 表现为按键时灵时不灵、录音状态
+    互相打架，而且第二个实例的托盘图标会跟第一个叠在一起，用户根本分不清。
+
+    用 Windows 命名互斥体（Local\\ 作用域，只在本用户会话内生效）。
+    任何异常都返回 True：宁可少一层保护，也不能因此起不来。
+    """
+    global _SINGLETON_MUTEX
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel32.CreateMutexW.restype = wintypes.HANDLE
+        kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+
+        handle = kernel32.CreateMutexW(None, False, name)
+        if not handle:
+            return True                        # 建不出来就不挡
+
+        ERROR_ALREADY_EXISTS = 183
+        if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
+            kernel32.CloseHandle(handle)
+            return False
+
+        _SINGLETON_MUTEX = handle              # 持有到进程退出
+        return True
+    except Exception:
+        return True
+
+
+def _warn_already_running() -> None:
+    """已经有一个实例在跑时，弹个系统消息框说明怎么办（控制台可能已隐藏）。"""
+    try:
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(
+            None,
+            'Speak More 已经在运行了，本窗口会关闭。\n\n'
+            '请到任务栏右下角的托盘图标里操作；\n'
+            '如果看不到图标，点一下那个「^」把隐藏的图标展开。',
+            'Speak More', 0x40)               # MB_ICONINFORMATION
+    except Exception:
+        pass
+
+
 
 class CapsWriterClient:
     """
@@ -138,6 +192,13 @@ class CapsWriterClient:
         
         自动根据命令行参数识别模式。内部管理异步循环。
         """
+
+        # [补丁] 单实例保护：必须在注册全局快捷键、启托盘之前拦下来 ——
+        # 两份键盘钩子已经开始互相抢键了再退就晚了。
+        if not _acquire_single_instance():
+            logger.warning('已有一个 Speak More 在运行，本实例直接退出')
+            _warn_already_running()
+            return
 
         # 注册退出函数
         register_signal(self.stop)
