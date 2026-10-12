@@ -49,7 +49,10 @@ from . import logger
 from .mic_test import MicTestPanel
 
 # 安装目录（core/ui/settings_dialog.py -> 往上三级）
-REPO_ROOT = Path(__file__).resolve().parents[2]
+# 程序根目录（打包时 = exe 同级目录）。别用 __file__ 上溯：打包时 core/ 可能是
+# 目录联接，resolve() 会展开成源码树路径，导致「打开日志/安装目录」打开错地方。
+from core.tools.paths import install_root as _install_root
+REPO_ROOT = _install_root()
 
 try:                                    # 软依赖：拿不到就用兜底值
     from core.ui.toast_constants import DEFAULT_FONT_FAMILY

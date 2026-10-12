@@ -32,8 +32,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
-# 项目根：core/client/hotword/hot_file.py -> 上溯四级
-_ROOT = Path(__file__).resolve().parents[3]
+# 项目根（打包时 = exe 同级目录）。别用 __file__ 上溯：打包时 core/ 可能是
+# 目录联接，resolve() 会展开成源码树路径 —— 那样在打包版里编辑热词表，
+# 改的是源码树的 hot.txt，发行版自己的那份纹丝不动。
+from core.tools.paths import install_root as _install_root
+_ROOT = _install_root()
 
 _LOCK = threading.RLock()
 

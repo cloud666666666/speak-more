@@ -47,7 +47,16 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
+def _install_root() -> Path:
+    """程序根目录（打包时是 exe 同级目录）。理由见 core/tools/paths.py。"""
+    try:
+        from core.tools.paths import install_root
+        return install_root()
+    except Exception:
+        return Path(__file__).resolve().parents[2]
+
+
+_REPO_ROOT = _install_root()
 _CACHE_PATH = _REPO_ROOT / 'logs' / 'gpu_probe.json'
 _CACHE_TTL_DAYS = 7          # 硬件清单最多缓存这么久，超期重新枚举
 _WMI_TIMEOUT = 15            # 拉 powershell 的超时，超了就跳过（只影响展示）

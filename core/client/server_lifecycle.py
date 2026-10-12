@@ -47,7 +47,16 @@ _ensure_lock = threading.Lock()
 # ============================================================
 
 def base_dir() -> Path:
-    return Path(__file__).resolve().parents[2]
+    """
+    本程序的安装目录。
+
+    [补丁] 一律走 core.tools.paths.install_root()，别在这里写 __file__ 推导：
+    打包时 core/ 可能是目录联接（build.spec 就是用 mklink /j 联进 dist 的），
+    Path.resolve() 会把联接展开成源码树路径，于是这里的「安装目录」跟进程实际
+    的工作目录对不上 —— 实测后果是孤儿清理的 cwd 判据永远不匹配、静默失效。
+    """
+    from core.tools.paths import install_root
+    return install_root()
 
 
 def server_port() -> int:
@@ -139,10 +148,16 @@ def _kill_orphan_workers() -> int:
     Windows 不会连带杀掉子进程 —— 那些孤儿会继续占着
     1.4GB 内存和 1.7GB 显存，而且没有任何界面能看到它们。
 
-    识别条件收紧到三条同时满足，避免误伤别的程序的 multiprocessing 进程：
-      1. 命令行里有 'spawn_main'
-      2. 工作目录就是本程序的安装目录
-      3. 父进程已经不存在了
+    识别条件收紧到四条同时满足，避免误伤别的程序的 multiprocessing 进程：
+      1. 进程名是 python*（源码形态）或是本程序的服务端 exe（打包形态）
+      2. 命令行里有 spawn_main 或 --multiprocessing-fork
+      3. 工作目录就是本程序的安装目录
+      4. 父进程已经不存在了
+
+    [补丁] 第 1、2 条原本只认 python* + spawn_main —— 那是**源码形态**的特征。
+    打包后 worker 的命令行实测是 `start_server.exe --multiprocessing-fork`，
+    既不以 python 开头、也没有 spawn_main 字样，于是这段清理在发行版里
+    永远匹配不到任何进程（等于空转）。这里把两种形态都覆盖上。
     """
     if psutil is None:
         return 0
@@ -152,11 +167,12 @@ def _kill_orphan_workers() -> int:
     for proc in psutil.process_iter(['pid', 'name', 'cmdline', 'ppid']):
         try:
             info = proc.info
-            if not (info['name'] or '').lower().startswith('python'):
+            name = (info['name'] or '').lower()
+            if not (name.startswith('python') or name in ('start_server.exe', 'start_server')):
                 continue
 
             cmdline = ' '.join(info['cmdline'] or [])
-            if 'spawn_main' not in cmdline:
+            if 'spawn_main' not in cmdline and '--multiprocessing-fork' not in cmdline:
                 continue
 
             ppid = info.get('ppid')
