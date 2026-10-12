@@ -394,7 +394,7 @@ def enable_min_to_tray(name: Optional[str] = None, icon_path: Optional[str] = No
     # 检查托盘功能是否可用
     if not _check_tray_available():
         logger.info("托盘功能不可用，跳过启用")
-        return
+        return False
 
     # DPI 感知设置
     try:
@@ -405,13 +405,22 @@ def enable_min_to_tray(name: Optional[str] = None, icon_path: Optional[str] = No
 
     with _lock:
         if _tray_instance is not None:
-            return  # 已启动
+            return True  # 已启动
 
+        # [补丁] 原本这里是没有控制台就静默 return，调用方却照样打
+        # 「托盘图标已启用」—— 于是出现"托盘没了、日志说没事"。
+        # 而托盘是设置面板与退出操作的唯一图形入口，静默失败等于用户无路可走，
+        # 所以这里必须留下痕迹并告诉调用方。
         if not _get_console_hwnd():
-            return  # 没有控制台窗口
+            logger.warning(
+                "没有控制台窗口，托盘图标无法启用"
+                "（本程序靠控制台窗口来挂托盘图标；用 pythonw、重定向输出、"
+                "或某些启动器启动时会丢掉控制台）")
+            return False
 
         _tray_instance = _TraySystem(name, icon_path, more_options, default_option)
         _tray_instance.start()
+        return True
 
 
 

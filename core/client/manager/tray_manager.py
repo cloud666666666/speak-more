@@ -37,7 +37,7 @@ class TrayManager:
         except Exception:
             _tray_title = 'CapsWriter Client'
 
-        enable_min_to_tray(
+        tray_ok = enable_min_to_tray(
             _tray_title,
             icon_path,
             exit_callback=self.app.stop,
@@ -58,7 +58,20 @@ class TrayManager:
             # 控制台窗口弹出来，用户看到的是一个莫名其妙的 cmd 黑框。
             default_option='⚙️ 设置',
         )
-        logger.info("托盘图标已启用")
+        if tray_ok:
+            logger.info("托盘图标已启用")
+        else:
+            # [补丁] 托盘没起来必须让用户知道：它是设置面板和「退出」的唯一入口，
+            # 静默失败的话用户既改不了配置也退不出程序（只能任务管理器）。
+            logger.warning("托盘图标未启用：设置面板与退出入口都会缺失")
+            try:
+                from ..ui import toast
+                toast('托盘图标没能启用，设置面板将打不开。\n'
+                      '请关掉本程序，改为双击 Speak More.exe 启动。',
+                      font_size=11, duration=12000, bg='#2B3440',
+                      initial_width=0.3)
+            except Exception:
+                pass
 
     def stop(self):
         """停止托盘图标"""
