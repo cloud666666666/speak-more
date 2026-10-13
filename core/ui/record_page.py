@@ -44,9 +44,11 @@ class RecordPage(ttk.Frame):
 
     def __init__(self, master: tk.Misc,
                  insert_text: Optional[Callable[[str], None]] = None,
+                 on_learn: Optional[Callable[[list], str]] = None,
                  bg: str = 'white', **kw: Any):
         super().__init__(master, **kw)
         self._insert = insert_text
+        self._learn = on_learn
         self._kind = ''
         self._keyword = ''
         self._limit = PAGE_SIZE
@@ -199,6 +201,11 @@ class RecordPage(ttk.Frame):
         tk.Button(head, text='删除', font=F_HINT, bd=0, bg='white', fg=BAD,
                   activebackground='white', cursor='hand2',
                   command=lambda e=entry: self._delete(e)).pack(side='right')
+        # 纠正 → 学词条（内置 learner，不依赖 app，所以总是可用）
+        tk.Button(head, text='✏️ 纠正', font=F_HINT, bd=0, bg='white',
+                  fg=ACCENT, activebackground='white', cursor='hand2',
+                  command=lambda e=entry: self._correct(e)).pack(
+            side='right', padx=(0, 6))
         if entry.kind == H.KIND_CHAT and entry.reply:
             tk.Button(head, text='插入', font=F_HINT, bd=0, bg='white', fg=ACCENT,
                       activebackground='white', cursor='hand2',
@@ -272,3 +279,100 @@ class RecordPage(ttk.Frame):
                                        parent=self)
             except Exception:
                 pass
+
+    # ---------------- 纠正 → 学词条 ----------------
+
+    def _correct(self, entry: Any) -> None:
+        """
+        「✏️ 纠正」：把识别结果改一遍，从改动里学词条。
+
+        对标 Typeless 的"纠一个词之后自动记住你偏好的写法"。区别是入口 ——
+        它靠监听你在别处的修改（要 UI 自动化），我们把编辑框放在这里，
+        你改什么我们才知道什么，不偷看别的窗口。
+
+        注意：**不改这条记录本身** —— 日记是"当时输出成什么样"的存档。
+        """
+        if self._learn is None:
+            try:
+                from core.client.hotword.learn import diff_words  # noqa: F401
+            except Exception as e:
+                logger.warning(f'词典学习模块不可用，纠正功能关闭: {e}')
+                return
+        original = entry.text
+        corrected = self._ask_correction(original)
+        if corrected is None or corrected.strip() == original.strip():
+            return
+        try:
+            from core.client.hotword.learn import diff_words, learn_and_save
+            pairs = diff_words(original, corrected)
+        except Exception as e:
+            logger.warning(f'比对纠正失败: {e}')
+            pairs = []
+            learn_and_save = None
+        if not pairs:
+            try:
+                messagebox.showinfo('纠正', '没发现能当词条的改动'
+                                            '（只动了标点，或者只是增删了内容）。',
+                                    parent=self)
+            except Exception:
+                pass
+            return
+        lines = '\n'.join(f'    {w}   →   {r}' for w, r in pairs)
+        try:
+            yes = messagebox.askyesno(
+                '加进词典？',
+                f'从这次纠正里发现这些改动：\n\n{lines}\n\n'
+                '加进词典后，以后说到「误写」那一侧也会自动改成「正确写法」'
+                '（热词是按读音模糊匹配的，所以念错也能纠回来）。',
+                parent=self)
+        except Exception:
+            yes = False
+        if not yes:
+            return
+        try:
+            learner = self._learn or learn_and_save
+            summary = learner(pairs)
+            messagebox.showinfo('词典', summary or '已加进词典。', parent=self)
+        except Exception as e:
+            logger.warning(f'学习词条失败: {e}')
+            try:
+                messagebox.showwarning('词典', f'加进词典失败：{e}', parent=self)
+            except Exception:
+                pass
+
+    def _ask_correction(self, text: str) -> Optional[str]:
+        """弹个编辑框让用户改识别结果。取消返回 None。"""
+        try:
+            top = tk.Toplevel(self)
+            top.title('纠正这句话')
+            top.transient(self.winfo_toplevel())
+            try:
+                top.grab_set()
+            except Exception:
+                pass
+            tk.Label(top, text='把识别结果改成正确的写法，确定后我会从改动里学词条',
+                     font=F_HINT, fg=HINT, bg='white').pack(
+                anchor='w', padx=12, pady=(12, 6))
+            box = tk.Text(top, width=66, height=5, wrap='word', font=F_TEXT,
+                          relief='solid', borderwidth=1)
+            box.pack(padx=12, pady=(0, 8))
+            box.insert('1.0', text)
+            box.focus_set()
+
+            result: dict = {'v': None}
+
+            def _ok() -> None:
+                result['v'] = box.get('1.0', 'end-1c')
+                top.destroy()
+
+            bar = ttk.Frame(top)
+            bar.pack(fill='x', padx=12, pady=(0, 12))
+            ttk.Button(bar, text='确定', command=_ok).pack(side='right')
+            ttk.Button(bar, text='取消', command=top.destroy).pack(
+                side='right', padx=(0, 6))
+            top.bind('<Escape>', lambda _e: top.destroy())
+            top.wait_window()          # 模态（本来就在 Tk 线程上）
+            return result['v']
+        except Exception as e:
+            logger.warning(f'打开纠正框失败: {e}')
+            return None

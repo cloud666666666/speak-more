@@ -28,9 +28,10 @@ from __future__ import annotations
 import os
 import shutil
 import threading
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import Iterable, List, Optional, Tuple
 
 # 项目根（打包时 = exe 同级目录）。别用 __file__ 上溯：打包时 core/ 可能是
 # 目录联接，resolve() 会展开成源码树路径 —— 那样在打包版里编辑热词表，
@@ -155,3 +156,116 @@ def lint(text: str) -> List[str]:
                     warnings.append(msg)
                 break
     return warnings[:5]
+
+
+# ============================================================
+#  词条级增删改（设置面板「词典」页用）
+#
+#  hot.txt 的行格式：
+#      target | 别名1 | 别名2 ~~~ 黑名单1 | 黑名单2
+#  以 # 开头的整行是注释，空行忽略。
+# ============================================================
+
+@dataclass
+class Word:
+    """hot.txt 里的一条词条。"""
+    line_no: int
+    target: str                            # 正确写法（行首那一个）
+    aliases: Tuple[str, ...] = ()
+    blocked: Tuple[str, ...] = ()          # ~~~ 后面的黑名单
+    raw: str = ''
+
+    @property
+    def forms(self) -> Tuple[str, ...]:
+        """这一条能匹配的所有写法（正确写法 + 别名）。"""
+        return (self.target,) + tuple(self.aliases)
+
+
+def parse_words(text: str) -> List[Word]:
+    """解析成词条列表（注释行、空行跳过）；line_no 是 1-based 行号。"""
+    out: List[Word] = []
+    for i, raw in enumerate((text or '').splitlines(), 1):
+        head, _, tail = raw.partition('~~~')
+        line = head.strip()
+        if not line or line.startswith('#'):
+            continue
+        parts = [p.strip() for p in line.split('|') if p.strip()]
+        if not parts:
+            continue
+        blocked = tuple(p.strip() for p in tail.split('|') if p.strip())
+        out.append(Word(line_no=i, target=parts[0], aliases=tuple(parts[1:]),
+                        blocked=blocked, raw=raw))
+    return out
+
+
+def format_word(target: str, aliases: Iterable[str] = (),
+                blocked: Iterable[str] = ()) -> str:
+    """拼成 hot.txt 的一行。"""
+    parts = [target.strip()] + [a.strip() for a in aliases if a and a.strip()]
+    line = ' | '.join(parts)
+    bl = [b.strip() for b in blocked if b and b.strip()]
+    if bl:
+        line += ' ~~~ ' + ' | '.join(bl)
+    return line
+
+
+def find_word(text: str, target: str) -> Optional[Word]:
+    """按正确写法找词条（大小写敏感 —— 热词表本来就区分大小写）。"""
+    t = (target or '').strip()
+    if not t:
+        return None
+    for w in parse_words(text):
+        if w.target == t:
+            return w
+    return None
+
+
+def add_word(text: str, target: str, aliases: Iterable[str] = (),
+             blocked: Iterable[str] = ()) -> Tuple[str, bool]:
+    """
+    追加一条词条到文件末尾。已存在同名 target 时不重复添加。
+
+    返回 (新文本, 是否真的加了)。
+    """
+    target = (target or '').strip()
+    if not target or find_word(text, target):
+        return text, False
+    new_line = format_word(target, aliases, blocked)
+    body = (text or '').rstrip('\n')
+    return (f'{body}\n{new_line}\n' if body else f'{new_line}\n'), True
+
+
+def remove_word(text: str, line_no: int) -> str:
+    """删掉某一行的词条（只删这一行，注释与其它词条不动）。"""
+    lines = (text or '').splitlines()
+    if not (1 <= line_no <= len(lines)):
+        return text
+    del lines[line_no - 1]
+    return '\n'.join(lines) + ('\n' if (text or '').endswith('\n') else '')
+
+
+def import_csv(text: str, csv_text: str) -> Tuple[str, int, List[str]]:
+    """
+    从 CSV 文本导入词条。
+
+    每行一列就是词条；多列时**第一列是正确写法、其余列是别名**
+    （正好对应 hot.txt 的 `A | B | C`）。`#` 开头的行当注释跳过。
+
+    返回 (新文本, 新增条数, 已存在而跳过的词条列表)。
+    """
+    added = 0
+    skipped: List[str] = []
+    for raw in (csv_text or '').splitlines():
+        line = raw.strip().lstrip('﻿')
+        if not line or line.startswith('#'):
+            continue
+        cells = [c.strip().strip('"').strip("'") for c in line.split(',')]
+        cells = [c for c in cells if c]
+        if not cells:
+            continue
+        text, ok = add_word(text, cells[0], cells[1:])
+        if ok:
+            added += 1
+        else:
+            skipped.append(cells[0])
+    return text, added, skipped

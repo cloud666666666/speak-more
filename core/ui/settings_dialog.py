@@ -280,6 +280,9 @@ class SettingsDialog:
         # 有合理默认值、基本不用动的收进了「高级」。
         nb = ttk.Notebook(outer)
         nb.pack(side='top', fill='both', expand=True)
+        # [补丁] 切回「热词」页时重读一遍 hot.txt —— 「记录」页的「纠正」会把学到的
+        # 词直接写进文件（不经本面板保存），不重读的话这一页显示的还是打开时的旧内容。
+        nb.bind('<<NotebookTabChanged>>', self._on_tab_changed)
 
         for tier, tab_title in S.TIERS:
             if tier == 'about':
@@ -523,6 +526,7 @@ class SettingsDialog:
             from core.ui.record_page import RecordPage
             browser = RecordPage(body, insert_text=self._insert_text)
             browser.grid(row=0, column=0, sticky='nsew', padx=4, pady=(8, 0))
+            self._record_browser = browser
         except Exception as e:
             logger.warning(f'历史列表加载失败: {e}')
             ttk.Label(body, text=f'历史列表不可用：{e}', font=F_HINT,
@@ -534,6 +538,37 @@ class SettingsDialog:
         row = 0
         for group in S.groups_in_tier('records'):
             row = self._build_group(holder, group, snapshot, row)
+
+    def _on_tab_changed(self, event: tk.Event) -> None:
+        """
+        切页时刷新。
+
+        「热词」页必须重读 hot.txt：「记录」页的「纠正」会把学到的词**直接写进文件**
+        （不走本面板的保存流程），所以这一页的内容随时可能已经过期。
+        「记录」页也重读一遍 —— 面板开着的时候可能又识别了几句。
+        """
+        try:
+            nb = event.widget
+            title = nb.tab(nb.select(), 'text')
+        except Exception:
+            return
+
+        if title == '热词':
+            try:
+                from core.client.hotword.hot_file import read_hot
+                text = read_hot()
+                if text is not None and self._hot_manual is not None \
+                        and self._hot_manual.get('1.0', 'end-1c') != text:
+                    self._set_hot_text(text)
+            except Exception as e:
+                logger.debug(f'刷新热词页失败: {e}')
+        elif title == '记录':
+            try:
+                page = getattr(self, '_record_browser', None)
+                if page is not None:
+                    page.reload()
+            except Exception as e:
+                logger.debug(f'刷新记录页失败: {e}')
 
     def _open_logs(self) -> None:
         self._open_dir(Path(REPO_ROOT) / 'logs')
@@ -705,19 +740,70 @@ class SettingsDialog:
                 row=row, column=0, sticky='w', padx=8, pady=(0, 12))
             return
 
-        ttk.Label(
-            body,
-            text=('写法：每行一个词，用 | 分隔别名 —— `宇树科技 | 雨树科技 | 语数科技`\n'
-                  '　　　要阻止某个替换，在该行后面加 `~~~ 要保护的词`；'
-                  '# 开头的是注释'),
-            font=F_HINT, foreground=HINT_COLOR, wraplength=740,
-            justify='left').grid(row=row, column=0, sticky='w', padx=8, pady=(0, 6))
+        # ============================================================
+        #  [补丁] 词典：词条列表（对标 Typeless 的 Dictionary）
+        #
+        #  原文编辑器仍然是**唯一的数据源** —— 这里的增删改都是先改
+        #  `_hot_manual` 里的文本、再重画列表，保存时照旧只提交那份文本。
+        #  所以不会出现"列表改了但没保存"或"两份数据打架"。
+        # ============================================================
+        ttk.Label(body, text='词典', font=F_GROUP, foreground=INK).grid(
+            row=row, column=0, sticky='w', padx=8, pady=(4, 2))
         row += 1
 
-        self._hot_manual = tk.Text(body, height=16, wrap='none', font=F_MONO,
+        add_bar = ttk.Frame(body)
+        add_bar.grid(row=row, column=0, sticky='ew', padx=8, pady=(0, 6))
+        row += 1
+        ttk.Label(add_bar, text='新词', font=F_SMALL,
+                  foreground=HINT_COLOR).pack(side='left', padx=(0, 6))
+        self._word_new_var = tk.StringVar()
+        ent = ttk.Entry(add_bar, textvariable=self._word_new_var, width=24)
+        ent.pack(side='left')
+        ent.bind('<Return>', lambda _e: self._add_word_from_entry())
+        ttk.Button(add_bar, text='添加', width=6,
+                   command=self._add_word_from_entry).pack(side='left', padx=(6, 12))
+        ttk.Button(add_bar, text='从 CSV 导入…',
+                   command=self._import_words_csv).pack(side='left')
+        self._word_count = ttk.Label(add_bar, text='', font=F_HINT,
+                                     foreground=HINT_COLOR)
+        self._word_count.pack(side='right')
+
+        list_wrap = ttk.Frame(body)
+        list_wrap.grid(row=row, column=0, sticky='ew', padx=8, pady=(0, 8))
+        list_wrap.columnconfigure(0, weight=1)
+        row += 1
+        self._word_canvas = tk.Canvas(list_wrap, height=150, bg='white',
+                                      highlightthickness=1,
+                                      highlightbackground='#dddddd')
+        self._word_canvas.grid(row=0, column=0, sticky='ew')
+        sb = ttk.Scrollbar(list_wrap, orient='vertical',
+                           command=self._word_canvas.yview)
+        sb.grid(row=0, column=1, sticky='ns')
+        self._word_canvas.configure(yscrollcommand=sb.set)
+        self._word_list = tk.Frame(self._word_canvas, bg='white')
+        self._word_list_id = self._word_canvas.create_window(
+            (0, 0), window=self._word_list, anchor='nw')
+        self._word_list.bind('<Configure>', lambda _e: self._word_canvas.configure(
+            scrollregion=self._word_canvas.bbox('all')))
+        self._word_canvas.bind('<Configure>', lambda e: self._word_canvas.itemconfigure(
+            self._word_list_id, width=e.width))
+
+        ttk.Label(body,
+                  text='写法：每行一个词，用 | 分隔别名 —— `宇树科技 | 雨树科技 | 语数科技`；'
+                       '要阻止某个替换，在该行后面加 `~~~ 要保护的词`；# 开头的是注释。',
+                  font=F_HINT, foreground=HINT_COLOR, wraplength=740,
+                  justify='left').grid(row=row, column=0, sticky='w', padx=8,
+                                       pady=(0, 6))
+        row += 1
+
+        ttk.Label(body, text='高级：直接编辑原文', font=F_GROUP, foreground=INK).grid(
+            row=row, column=0, sticky='w', padx=8, pady=(8, 2))
+        row += 1
+        self._hot_manual = tk.Text(body, height=12, wrap='none', font=F_MONO,
                                    relief='solid', borderwidth=1)
         self._hot_manual.grid(row=row, column=0, sticky='ew', padx=8, pady=(0, 6))
         self._hot_manual.insert('1.0', manual_text)
+        self._hot_manual.bind('<KeyRelease>', lambda _e: self._refresh_word_list())
         row += 1
 
         # 可疑写法提示。热词表有个静默的坑：一个词完整包含另一个词
@@ -733,7 +819,139 @@ class SettingsDialog:
                    command=lambda: self._open_dir(Path(REPO_ROOT))).grid(
             row=row, column=0, sticky='w', padx=8, pady=(0, 16))
 
+        self._refresh_word_list()
         self._refresh_hot_lint()
+
+    # ---------------- 词典：词条操作 ----------------
+
+    def _hot_text(self) -> str:
+        """当前原文编辑器里的内容（词典操作的唯一数据源）。"""
+        try:
+            return self._hot_manual.get('1.0', 'end-1c') if self._hot_manual else ''
+        except Exception:
+            return ''
+
+    def _set_hot_text(self, text: str) -> None:
+        """写回原文编辑器并刷新列表与体检。"""
+        if self._hot_manual is None:
+            return
+        try:
+            self._hot_manual.delete('1.0', 'end')
+            self._hot_manual.insert('1.0', text)
+        except Exception:
+            return
+        self._refresh_word_list()
+        self._refresh_hot_lint()
+
+    def _refresh_word_list(self) -> None:
+        """从原文解析词条并重画列表。"""
+        if getattr(self, '_word_list', None) is None:
+            return
+        for w in self._word_list.winfo_children():
+            try:
+                w.destroy()
+            except Exception:
+                pass
+        try:
+            from core.client.hotword.hot_file import parse_words
+            words = parse_words(self._hot_text())
+        except Exception as e:
+            words = []
+            logger.debug(f'解析词条失败: {e}')
+
+        try:
+            self._word_count.configure(text=f'共 {len(words)} 条')
+        except Exception:
+            pass
+
+        if not words:
+            tk.Label(self._word_list, text='（还没有词条）', font=F_HINT,
+                     bg='white', fg=HINT_COLOR).pack(anchor='w', padx=6, pady=4)
+            return
+
+        for w in words:
+            line = tk.Frame(self._word_list, bg='white')
+            line.pack(fill='x', padx=6, pady=1)
+            tk.Button(line, text='删除', font=F_HINT, bd=0, bg='white',
+                      fg=WARN_COLOR, activebackground='white', cursor='hand2',
+                      command=lambda ww=w: self._delete_word(ww)
+                      ).pack(side='right', padx=(4, 0))
+            detail = []
+            if w.aliases:
+                detail.append('别名：' + '、'.join(w.aliases))
+            if w.blocked:
+                detail.append('保护：' + '、'.join(w.blocked))
+            body_text = f'　{"　".join(detail)}' if detail else ''
+            tk.Label(line, text=f'{w.target}{body_text}', font=F_SMALL, bg='white',
+                     fg=INK if not detail else HINT_COLOR, anchor='w',
+                     justify='left').pack(side='left', fill='x', expand=True)
+
+    def _add_word_from_entry(self) -> None:
+        """把输入框里的词加进词典。"""
+        target = (self._word_new_var.get() or '').strip()
+        if not target:
+            return
+        try:
+            from core.client.hotword.hot_file import add_word, find_word
+            text = self._hot_text()
+            if find_word(text, target):
+                messagebox.showinfo('词典', f'「{target}」已经在词典里了。',
+                                    parent=self._dialog)
+                return
+            # 支持在输入框里直接用 | 写别名：`正确写法 | 别名1 | 别名2`
+            parts = [p.strip() for p in target.split('|') if p.strip()]
+            text, ok = add_word(text, parts[0], parts[1:])
+            if not ok:
+                return
+            self._set_hot_text(text)
+            self._word_new_var.set('')
+            logger.info(f'词典：新增词条 {parts[0]}')
+            messagebox.showinfo('词典',
+                                f'已添加「{parts[0]}」。\n\n'
+                                '点「保存」后生效（保存即热生效，不用重启）。',
+                                parent=self._dialog)
+        except Exception as e:
+            logger.warning(f'添加词条失败: {e}')
+            messagebox.showwarning('词典', f'添加失败：{e}', parent=self._dialog)
+
+    def _delete_word(self, word: Any) -> None:
+        try:
+            from core.client.hotword.hot_file import remove_word
+            if not messagebox.askyesno('删除词条',
+                                       f'从词典里删掉「{word.target}」？',
+                                       parent=self._dialog):
+                return
+            self._set_hot_text(remove_word(self._hot_text(), word.line_no))
+            logger.info(f'词典：删除词条 {word.target}')
+        except Exception as e:
+            logger.warning(f'删除词条失败: {e}')
+
+    def _import_words_csv(self) -> None:
+        """从 CSV 导入词条（每行第一列是正确写法，其余列是别名）。"""
+        try:
+            from tkinter import filedialog
+            from core.client.hotword.hot_file import import_csv
+            path = filedialog.askopenfilename(
+                parent=self._dialog, title='选择词条 CSV',
+                filetypes=[('CSV 文件', '*.csv'), ('文本文件', '*.txt'),
+                           ('所有文件', '*.*')])
+            if not path:
+                return
+            raw = Path(path).read_text(encoding='utf-8-sig', errors='replace')
+            text, added, skipped = import_csv(self._hot_text(), raw)
+            if added:
+                self._set_hot_text(text)
+            logger.info(f'词典：CSV 导入新增 {added} 条，跳过 {len(skipped)} 条')
+            msg = f'导入完成：新增 {added} 条。'
+            if skipped:
+                msg += f'\n\n已在词典里、跳过的 {len(skipped)} 条：\n' + '、'.join(skipped[:8])
+                if len(skipped) > 8:
+                    msg += f' …等 {len(skipped)} 条'
+            msg += '\n\n点「保存」后生效。'
+            messagebox.showinfo('词典', msg, parent=self._dialog)
+        except Exception as e:
+            logger.warning(f'导入 CSV 失败: {e}')
+            messagebox.showwarning('词典', f'导入失败：{e}', parent=self._dialog)
 
     def _refresh_hot_lint(self) -> None:
         """跑一遍热词表体检，把可疑行显示出来。"""
