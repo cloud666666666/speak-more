@@ -209,3 +209,6 @@ hot-rule.txt.bak
 # Windows 杂物
 Thumbs.db
 Desktop.ini
+
+# 图标生成脚本的产物（assets/make_icon.py 生成，需要时重跑即可）
+assets/icon_preview_16.png
