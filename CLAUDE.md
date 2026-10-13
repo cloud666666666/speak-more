@@ -1,4 +1,11 @@
-# CapsWriter-Offline 开发指南
+# Speak More 开发指南
+
+> 本仓库是 **CapsWriter-Offline**（上游，作者 HaujetZhao，MIT）的二次开发分支，
+> 定位是「在上游之上加一层**装好就能用**的外壳」。**上游的识别内核一行未改** ——
+> 改动集中在外壳层，每处都带 `[补丁]` 注释说明原因。
+>
+> 与上游的关系：合并基线是上游的 `84912d5`（2026-09-14），
+> `git diff 84912d5..HEAD` 就是本分支的全部差异（40+ 文件、+9000 行左右）。
 
 ## 核心设计 (Core Design)
 **"快、准、稳、离线"**
@@ -8,7 +15,9 @@
     - **Client**: 轻量启动，负责全局快捷键监听、录音采集、UI 展示。
 - **源代码开放**: 入口 [`start_server.py`](start_server.py) / [`start_client.py`](start_client.py) 为冻结入口；核心源码在 [`core/`](core/) 目录，发行版保留为源码供用户修改。
 - **配置化**: [`config_client.py`](config_client.py) / [`config_server.py`](config_server.py) 及 `hot*.txt`、[`LLM/*.py`](LLM/) 位于根目录。
-- **版本**: v2.5-alpha（2026-04-28）
+  **本分支的运行时配置不回写这些文件**：设置走 [`config_local.py`](config_local.py) 的
+  `config_local.json` 覆盖层，优先级 = 源码默认 < 补丁默认(`PATCH_*`) < JSON。
+- **版本**: 上游内核 v2.6；本分支外壳 v0.1（2026-10-13 首发）
 
 ## 架构细节与流程 (Architecture & Workflows)
 
@@ -103,16 +112,31 @@
     - [`transcribe/`](core/client/transcribe/) - `FileTranscriber` 文件转录
     - [`diary/diary_writer.py`](core/client/diary/diary_writer.py) - `DiaryWriter` 日记归档
     - [`udp/`](core/client/udp/) - UDP 广播与远程控制
+    - [`server_lifecycle.py`](core/client/server_lifecycle.py) - **服务端托管**：拉起 / 退出收尾 / 看门狗 / 孤儿清理
+    - [`model_precheck.py`](core/client/model_precheck.py) - 启动预检：缺模型 / 缺 DLL 时弹窗说清
+    - [`standalone_settings.py`](core/client/standalone_settings.py) - `--settings` 独立设置模式（托盘坏掉时的逃生通道）
+    - [`settings_apply.py`](core/client/settings_apply.py) - 设置落盘 + 热生效（`apply_result`，`app=None` 即独立模式）
 - **共享工具**: [`core/tools/`](core/tools/) — ITN、格式化、信号处理、窗口检测、简繁转换
-- **UI 组件**: [`core/ui/`](core/ui/) — Toast、Tray、对话框（热词/纠错）
+    - [`paths.py`](core/tools/paths.py) - `install_root()`：程序根目录。**别自己写 `Path(__file__).resolve()`** —— 打包时 `core/` 是目录联接，`resolve()` 会把它展开成源码树的路径（实测坑过四处：孤儿清理、打开日志目录、热词表、显卡缓存）
+    - [`model_paths.py`](core/tools/model_paths.py) - 模型 / llama.cpp DLL 路径表 + 缺失检查（客户端与服务端共用同一份判断）
+    - [`gpu_probe.py`](core/tools/gpu_probe.py) - 显卡探测 + 后端选择 + **验活**（onnxruntime 会静默回落到 CPU，只查 provider 列表不算数）
+- **UI 组件**: [`core/ui/`](core/ui/) — Toast、Tray、对话框、**设置面板**（[`settings_dialog.py`](core/ui/settings_dialog.py) + [`settings_handler.py`](core/ui/settings_handler.py) + [`settings_schema.py`](core/ui/settings_schema.py)）、首启向导、按键捕获、录音浮层、图标统一（[`app_icon.py`](core/ui/app_icon.py)）
+    - ⚠️ **工作线程不能碰 Tk**（连 `after()` 都不行）：对话框打开时（主线程在 `wait_window`）会卡住或抛 `RuntimeError: main thread is not in main loop`，异常被 `except` 吞掉后表现就是"点了没反应"（测试麦克风 / 测试连接都中过招）。回传结果用 [`dialogs.py`](core/ui/dialogs.py) 的 `ThreadSlot` + `poll_slot`
 - **协议**: [`core/protocol.py`](core/protocol.py) — `AudioMessage` + `RecognitionMessage`
 - **日志**: `logs/client_latest.log` & `logs/server_latest.log`（排查问题唯一入口）
 
 ## 打包与部署 (Build)
-- [`build.spec`](build.spec): Server + Client 打包。
-- [`build-client.spec`](build-client.spec): 仅 Client (Win7兼容)。
+- [`build.spec`](build.spec): 服务端 + 客户端 → `dist/Speak More/`（客户端产物叫 `Speak More.exe`，服务端 `start_server.exe`）。
+- [`build-client.spec`](build-client.spec): 仅客户端。
+- [`zip_release.py`](zip_release.py): **纯 Python 打发行 zip**（不依赖 7-Zip），产出 `release/SpeakMore-<日期>.zip`。
+  默认不含模型（`--with-models` 可打一体包）；会自动排除日记归档、logs、本地配置。
 - **策略**: 所有 Python 依赖放入 `internal/`。根目录仅保留配置文件、源码入口 ([`start_*.py`](start_server.py))、核心源码 ([`core/`](core/))、模型文件夹 ([`models/`](models/)) 和说明文档。
 - **PyInstaller 6.0+**: 使用现代化打包配置，支持 CUDA provider 可选收集。
+- ⚠️ **打包前必须退出所有正在运行的实例** —— exe 被占用时 PyInstaller 写不进 `dist/`，
+  却照样打印"完成"、退出码 0，`dist/` 里留的是上一次的产物（踩过一次）。
+- ⚠️ **不要排除 `internal/*.pyc`** —— noarchive 模式下整个运行时就是松散的 .pyc（近 5000 个），
+  排掉之后 exe 会报 `Failed to import encodings module` 起不来。
+- ⚠️ PyInstaller 按 **exe 自己所在的目录**找 `internal/`，所以 `start_server.exe` 挪不进子目录。
 
 ## 模型支持 (Models)
 
@@ -172,5 +196,7 @@
 
 ## 用户偏好 (User Preferences)
 - **语言**: 中文 (Chinese)，总结、Plan、WalkThrough、注释都要用中文。
-- **环境**: 运行环境是 `conda activate c`，或用 `D:/anaconda3/envs/c/python.exe` 或 `conda run -n c` 执行。所有的临时 Python 代码要先写到临时脚本文件，再运行，而不要直接用命令行跑代码。临时脚本用完不要删。
+- **环境**: 用项目自带的 uv 虚拟环境 —— `.venv/Scripts/python.exe`（Python 3.14），或 `uv run python ...`。
+  （旧说明里的 `conda activate c` 已不存在：上游 2026-09 改用 uv 管理环境。）
+  所有的临时 Python 代码要先写到临时脚本文件，再运行，而不要直接用命令行跑代码。临时脚本用完不要删（默认放 `logs/`，那里被 gitignore 挡着）。
 
