@@ -122,6 +122,11 @@ def _apply_hotwords(app: Any, hot_in: Any, report: ApplyReport) -> bool:
 
     logger.info(f'热词表已由设置面板改写（{len(manual)} 字符）')
 
+    # 独立模式（app=None）：只落盘，不做热重载（没有运行中的热词管理器）
+    if app is None:
+        report.applied.append('热词表')
+        return True
+
     # 立刻生效。文件监视器也会在 3 秒内重载，但用户刚点了保存就该马上能用。
     try:
         app.hotword.load_all()
@@ -202,6 +207,19 @@ def apply_result(app: Any, data: Dict[str, Any],
         config_local.apply_client_overrides(Config)
     except Exception as e:
         report.errors.append(f'套用配置失败: {e}')
+        return report
+
+    # ---------- 独立模式（--settings 逃生通道）：到此为止 ----------
+    #
+    # app 为 None 表示这是 `Speak More.exe --settings`：没有客户端在跑，
+    # 没有快捷键要重建、没有音频流要重开、没有托盘要刷新 —— 落盘就够了，
+    # 用完即退，所以直接告诉用户「下次启动生效」。
+    # 写盘部分与正常运行**完全共用**，不会出现两种模式写出不同结果。
+    if app is None:
+        _apply_hotwords(None, data.get('hotwords'), report)
+        if client_in or roles_in or report.applied:
+            report.restart.append('所有改动将在下次启动时生效')
+        logger.info('独立设置模式：已落盘，不做热生效')
         return report
 
     # ---------- 2.5) 热词表 ----------
