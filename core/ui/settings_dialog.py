@@ -694,6 +694,12 @@ class SettingsDialog:
         self._btn_llm_test.configure(state='disabled')
         self._llm_test_label.configure(text='正在测试…', fg=HINT_COLOR)
 
+        # 工作线程只写这个槽，结果由 Tk 线程轮询取 —— 工作线程直接 after()
+        # 在对话框打开时（主线程在 wait_window）会卡住/抛异常，然后被吞掉，
+        # 表现就是"点了测试连接没反应"。见 core/ui/dialogs.py:ThreadSlot
+        from core.ui.dialogs import ThreadSlot, poll_slot
+        slot = ThreadSlot()
+
         def worker() -> None:
             try:
                 # 延迟导入，避免 UI 层在 import 期就依赖客户端的 LLM 子系统
@@ -702,22 +708,20 @@ class SettingsDialog:
                 ok, msg = test_connection(_S.GENERIC_PROVIDER, url, key, model)
             except Exception as e:
                 ok, msg = False, f'测试出错: {e}'
-
-            def apply() -> None:
-                try:
-                    self._llm_test_label.configure(text=msg,
-                                                   fg='#15803d' if ok else '#b91c1c')
-                    self._btn_llm_test.configure(state='normal')
-                except Exception:
-                    pass
-
-            try:
-                if self._dialog is not None:
-                    self._dialog.after(0, apply)
-            except Exception:
-                pass
+            slot.put((bool(ok), str(msg)))
 
         threading.Thread(target=worker, daemon=True, name='LLMTestPanel').start()
+        poll_slot(self._dialog, slot, self._on_llm_test_done, timeout_s=60.0)
+
+    def _on_llm_test_done(self, result: Any) -> None:
+        """测试连接的结果回到 Tk 线程之后（result 为 None 表示超时）。"""
+        ok, msg = result if result else (False, '测试超时，没有收到结果')
+        try:
+            self._llm_test_label.configure(text=msg,
+                                           fg='#15803d' if ok else '#b91c1c')
+            self._btn_llm_test.configure(state='normal')
+        except Exception:
+            pass
 
     def _build_mic_test(self, body: ttk.Frame, row: int) -> int:
         """

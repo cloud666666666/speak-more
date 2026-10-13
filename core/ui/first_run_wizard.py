@@ -520,6 +520,12 @@ class FirstRunWizard:
         self._btn_test.configure(state='disabled')
         self._test_label.configure(text='正在测试…', fg=MUTED)
 
+        # 工作线程只写这个槽，结果由 Tk 线程轮询取 —— 工作线程直接 after()
+        # 在对话框打开时（主线程在 wait_window）会卡住/抛异常，被吞掉之后
+        # 用户看到的就是"点了测试连接没反应"。见 core/ui/dialogs.py:ThreadSlot
+        from core.ui.dialogs import ThreadSlot, poll_slot
+        slot = ThreadSlot()
+
         def worker() -> None:
             try:
                 from core.client.llm.llm_test import test_connection
@@ -527,21 +533,19 @@ class FirstRunWizard:
                 ok, msg = test_connection(S.GENERIC_PROVIDER, url, key, model)
             except Exception as e:
                 ok, msg = False, f'测试出错: {e}'
-
-            def apply() -> None:
-                try:
-                    self._test_label.configure(text=msg, fg=OK if ok else BAD)
-                    self._btn_test.configure(state='normal')
-                except Exception:
-                    pass
-
-            try:
-                if self._dialog is not None:
-                    self._dialog.after(0, apply)
-            except Exception:
-                pass
+            slot.put((bool(ok), str(msg)))
 
         threading.Thread(target=worker, daemon=True, name='LLMTest').start()
+        poll_slot(self._dialog, slot, self._on_test_done, timeout_s=60.0)
+
+    def _on_test_done(self, result: Any) -> None:
+        """测试连接的结果回到 Tk 线程之后（result 为 None 表示超时）。"""
+        ok, msg = result if result else (False, '测试超时，没有收到结果')
+        try:
+            self._test_label.configure(text=msg, fg=OK if ok else BAD)
+            self._btn_test.configure(state='normal')
+        except Exception:
+            pass
 
     # ---------------- 收集 ----------------
 

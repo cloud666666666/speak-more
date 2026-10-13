@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+import queue
 import threading
 import time
 import tkinter as tk
@@ -64,6 +65,15 @@ class MicTestPanel(ttk.Frame):
         self._accent = accent
         self._testing = False
 
+        # [补丁] 工作线程 → UI 线程的消息队列。
+        # **绝不能从工作线程直接碰 Tk**：tkinter 在那种情况下抛
+        # RuntimeError('main thread is not in main loop')，而原来的 _ui() 把它
+        # 静默吞掉了 —— 表现就是"点了测试麦克风，结论一直是『请对着麦克风说几句话…』"，
+        # 进度条也不动。正常模式与 --settings 独立模式都中招（实测复现）。
+        # 现在改成：工作线程只往队列里放，UI 线程用 after 轮询取。
+        self._queue: "queue.Queue[tuple]" = queue.Queue()
+        self._polling = False
+
         # 第一行：按钮 + 电平条；第二行：结论。结论单独一行才不会把行撑得很宽
         self.columnconfigure(1, weight=1)
 
@@ -99,17 +109,55 @@ class MicTestPanel(ttk.Frame):
             self.draw_bar(0.0)
         except Exception:
             pass
+        self._start_polling()
         threading.Thread(target=self._worker, daemon=True,
                          name='MicTest').start()
 
     # ---------------- 内部 ----------------
 
-    def _ui(self, fn: Callable[[], None]) -> None:
-        """把回调排到 Tk 线程执行（测试跑在工作线程里）。"""
+    def _start_polling(self) -> None:
+        """开始轮询（start() 由按钮回调触发，本来就在 Tk 线程上跑）。"""
+        if self._polling:
+            return
+        self._polling = True
+        self._poll()
+
+    def _poll(self) -> None:
+        """
+        只在 Tk 线程上跑：把工作线程投递的结果刷到界面。
+
+        为什么不让工作线程直接 `after(0, ...)`：tkinter 会抛
+        RuntimeError('main thread is not in main loop') —— 异常一旦被吞，
+        用户看到的就是"点了没反应"。本面板原来就是这么坏的。
+        """
+        finished = False
         try:
-            root = self.winfo_toplevel()
-            if root is not None:
-                root.after(0, fn)
+            while True:
+                msg = self._queue.get_nowait()
+                kind = msg[0]
+                if kind == 'level':
+                    self.draw_bar(msg[1])
+                elif kind == 'finish':
+                    self.finish(*msg[1:])
+                    finished = True
+        except queue.Empty:
+            pass
+        except Exception:
+            pass
+
+        if finished:
+            self._polling = False
+            return
+        if self._polling:
+            try:
+                self.after(60, self._poll)
+            except Exception:
+                self._polling = False          # 面板已经销毁
+
+    def _post(self, *msg: Any) -> None:
+        """工作线程调用：只往队列里放，**绝不碰 Tk**。"""
+        try:
+            self._queue.put(msg)
         except Exception:
             pass
 
@@ -120,6 +168,16 @@ class MicTestPanel(ttk.Frame):
         except Exception:
             pass
 
+        if self._mic_apply is None:
+            # [补丁] `--settings` 独立设置模式下没有运行中的音频流（电平恒为 0），
+            # 硬测只会报「没收到声音」—— 那是在骗用户。直接说清楚。
+            # （日志里也记一笔：独立模式与正常运行的面板长得一样，
+            #   排查"我点的到底是哪个"时靠这行分辨。）
+            logger.info('独立设置模式：没有运行中的音频流，跳过麦克风测试')
+            self._post('finish', 0.0, False,
+                       '独立设置模式下测不了麦克风（保存后正常启动再试）')
+            return
+
         if self._mic_apply is not None:
             try:
                 applied = bool(self._mic_apply(device))
@@ -127,13 +185,13 @@ class MicTestPanel(ttk.Frame):
                 logger.warning(f'测试麦克风前应用设备失败: {e}')
                 applied = False
             if not applied:
-                self._ui(lambda: self.finish(0.0, False, '切换设备失败'))
+                self._post('finish', 0.0, False, '切换设备失败')
                 return
 
         try:
             from core.ui import recording_overlay as RO
         except Exception as e:
-            self._ui(lambda: self.finish(0.0, False, f'音频模块不可用: {e}'))
+            self._post('finish', 0.0, False, f'音频模块不可用: {e}')
             return
 
         RO.set_test_mode(True)
@@ -144,11 +202,11 @@ class MicTestPanel(ttk.Frame):
                 time.sleep(0.08)
                 level = RO.get_level()
                 peak = max(peak, level)
-                self._ui(lambda l=level: self.draw_bar(l))
+                self._post('level', level)
         finally:
             RO.set_test_mode(False)
 
-        self._ui(lambda: self.finish(peak, True))
+        self._post('finish', peak, True)
 
     def draw_bar(self, level: float) -> None:
         try:
