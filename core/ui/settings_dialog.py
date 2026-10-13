@@ -434,6 +434,29 @@ class SettingsDialog:
                 padx=8, pady=(0, 14))
             row += 1
 
+        # [补丁] 开机自启 —— README 里一直承诺"设置面板里一键开关"，
+        # 但 autostart.py 之前没有任何调用方（虚标）。这里把它接上。
+        ttk.Separator(body, orient='horizontal').grid(
+            row=row, column=0, columnspan=3, sticky='ew', padx=8, pady=(4, 12))
+        row += 1
+
+        ttk.Label(body, text='开机自启', font=F_GROUP, foreground=INK).grid(
+            row=row, column=0, columnspan=3, sticky='w', padx=8, pady=(0, 6))
+        row += 1
+        self._autostart_btn = ttk.Button(body, text='开启开机自启',
+                                         command=self._toggle_autostart)
+        self._autostart_btn.grid(row=row, column=0, sticky='w', padx=8,
+                                 pady=(0, 6))
+        row += 1
+        ttk.Label(body,
+                  text='在「启动」文件夹里放一个带图标的快捷方式，开机自动运行。'
+                       '想取消就点上面的按钮，或直接把那个快捷方式删掉。',
+                  font=F_HINT, foreground=HINT_COLOR, wraplength=740,
+                  justify='left').grid(row=row, column=0, columnspan=3,
+                                       sticky='w', padx=8, pady=(0, 14))
+        row += 1
+        self._refresh_autostart()
+
         ttk.Separator(body, orient='horizontal').grid(
             row=row, column=0, columnspan=3, sticky='ew', padx=8, pady=(4, 12))
         row += 1
@@ -555,6 +578,47 @@ class SettingsDialog:
 
         lines = format_lines(report)
         return '自检发现问题：\n' + '\n'.join(lines[:6]), False
+
+    # ---------------- 开机自启 ----------------
+
+    def _refresh_autostart(self) -> None:
+        """把按钮文字刷成当前状态。"""
+        try:
+            import autostart
+            on = autostart.is_enabled()
+        except Exception:
+            on = False
+        try:
+            self._autostart_btn.configure(
+                text='关闭开机自启' if on else '开启开机自启')
+        except Exception:
+            pass
+
+    def _toggle_autostart(self) -> None:
+        """
+        开/关开机自启。
+
+        两种形态的目标不同（见 autostart.link_target）：源码形态指向
+        「启动 Speak More.vbs」（包一层 .lnk 是为了图标），打包形态直接指向
+        Speak More.exe。
+        """
+        try:
+            import autostart
+            if autostart.is_enabled():
+                autostart.disable()
+                msg = '已关闭开机自启。'
+            else:
+                err = autostart.enable()
+                msg = (f'开启失败：{err}' if err
+                       else '已开启开机自启，下次开机会自动运行。')
+        except Exception as e:
+            msg = f'操作失败：{e}'
+        logger.info(f'开机自启：{msg}')
+        try:
+            messagebox.showinfo('开机自启', msg, parent=self._dialog)
+        except Exception:
+            pass
+        self._refresh_autostart()
 
     # ---------------- 「热词」页 ----------------
 

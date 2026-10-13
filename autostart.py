@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -70,6 +71,23 @@ def launcher_path() -> Path:
     return project_root() / LAUNCHER_VBS
 
 
+def link_target() -> tuple:
+    """
+    返回 (TargetPath, Arguments) —— .lnk 指向什么、带什么参数。
+
+    两种形态：
+      **打包版**：直接指向同目录的 Speak More.exe，不带参数。
+        （发行版里没有 启动 Speak More.vbs —— 它不在打包清单里，
+          而且 exe 自己就够用了）
+      **源码版**：指向 wscript.exe，参数是项目里的 启动 Speak More.vbs。
+        包这一层是为了图标：.vbs 直接放 Startup 里显示的是 wscript 的卷轴图标，
+        .lnk 才能带 IconLocation。
+    """
+    if getattr(sys, 'frozen', False):
+        return Path(sys.executable).resolve(), ''
+    return WSCRIPT, str(launcher_path())
+
+
 def icon_path() -> Path:
     return project_root() / 'assets' / 'icon.ico'
 
@@ -89,7 +107,7 @@ _PS_TEMPLATE = r'''
 $ErrorActionPreference = 'Stop'
 $s = (New-Object -ComObject WScript.Shell).CreateShortcut($env:SM_LNK)
 $s.TargetPath       = $env:SM_TARGET
-$s.Arguments        = '"' + $env:SM_ARGS + '"'
+if ($env:SM_ARGS) { $s.Arguments = '"' + $env:SM_ARGS + '"' }
 $s.WorkingDirectory = $env:SM_CWD
 $s.IconLocation     = $env:SM_ICON + ',0'
 # 刻意不设 $s.WindowStyle / $s.Description —— 见模块 docstring 里的坑
@@ -104,17 +122,16 @@ def enable() -> Optional[str]:
 
     幂等：已经装好了再调一次也没问题（覆盖写）。
     """
-    if not WSCRIPT.is_file():
-        return f'找不到 {WSCRIPT}'
-    if not launcher_path().is_file():
-        return f'找不到启动器 {launcher_path()}'
+    target, args = link_target()
+    if not target.is_file():
+        return f'找不到启动器 {target}'
 
     startup_dir().mkdir(parents=True, exist_ok=True)
 
     env = dict(os.environ)
     env['SM_LNK'] = str(link_path())
-    env['SM_TARGET'] = str(WSCRIPT)
-    env['SM_ARGS'] = str(launcher_path())
+    env['SM_TARGET'] = str(target)
+    env['SM_ARGS'] = args
     env['SM_CWD'] = str(project_root())
     env['SM_ICON'] = str(icon_path())
 
