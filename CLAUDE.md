@@ -107,6 +107,9 @@
     - [`output/result_processor.py`](core/client/output/result_processor.py) - `ResultProcessor` 后处理核心
     - [`output/text_output.py`](core/client/output/text_output.py) - `TextOutput` 上屏
     - [`hotword/`](core/client/hotword/) - 热词系统（Phoneme RAG + Rule + Rectification）
+        - [`hot_file.py`](core/client/hotword/hot_file.py) - hot.txt 读写 + 体检(lint) + 词条级增删改 / CSV 导入
+        - [`learn.py`](core/client/hotword/learn.py) - 从用户纠正里学词条（对齐 diff 后并进 hot.txt）
+    - [`history.py`](core/client/history.py) - 识别历史：解析日记归档（听写 / LLM 对话）、搜索、精确删除、保留策略
     - [`llm/`](core/client/llm/) - LLM 子系统（角色加载、上下文、API 调用）
     - [`manager/`](core/client/manager/) - `MicRunner` / `FileRunner` / `TrayManager`
     - [`transcribe/`](core/client/transcribe/) - `FileTranscriber` 文件转录
@@ -120,7 +123,7 @@
     - [`paths.py`](core/tools/paths.py) - `install_root()`：程序根目录。**别自己写 `Path(__file__).resolve()`** —— 打包时 `core/` 是目录联接，`resolve()` 会把它展开成源码树的路径（实测坑过四处：孤儿清理、打开日志目录、热词表、显卡缓存）
     - [`model_paths.py`](core/tools/model_paths.py) - 模型 / llama.cpp DLL 路径表 + 缺失检查（客户端与服务端共用同一份判断）
     - [`gpu_probe.py`](core/tools/gpu_probe.py) - 显卡探测 + 后端选择 + **验活**（onnxruntime 会静默回落到 CPU，只查 provider 列表不算数）
-- **UI 组件**: [`core/ui/`](core/ui/) — Toast、Tray、对话框、**设置面板**（[`settings_dialog.py`](core/ui/settings_dialog.py) + [`settings_handler.py`](core/ui/settings_handler.py) + [`settings_schema.py`](core/ui/settings_schema.py)）、首启向导、按键捕获、录音浮层、图标统一（[`app_icon.py`](core/ui/app_icon.py)）
+- **UI 组件**: [`core/ui/`](core/ui/) — Toast、Tray、对话框、**设置面板**（[`settings_dialog.py`](core/ui/settings_dialog.py) + [`settings_handler.py`](core/ui/settings_handler.py) + [`settings_schema.py`](core/ui/settings_schema.py)，列表类页面自己画：热词/词典页、[`record_page.py`](core/ui/record_page.py) 记录页）、首启向导、按键捕获、录音浮层、图标统一（[`app_icon.py`](core/ui/app_icon.py)）
     - ⚠️ **工作线程不能碰 Tk**（连 `after()` 都不行）：对话框打开时（主线程在 `wait_window`）会卡住或抛 `RuntimeError: main thread is not in main loop`，异常被 `except` 吞掉后表现就是"点了没反应"（测试麦克风 / 测试连接都中过招）。回传结果用 [`dialogs.py`](core/ui/dialogs.py) 的 `ThreadSlot` + `poll_slot`
 - **协议**: [`core/protocol.py`](core/protocol.py) — `AudioMessage` + `RecognitionMessage`
 - **日志**: `logs/client_latest.log` & `logs/server_latest.log`（排查问题唯一入口）
