@@ -55,6 +55,9 @@ EXTRA_CLIENT_DEFAULTS: Dict[str, Any] = {
     'mic_device_index': -1,         # 设备名匹配不到时的兜底索引，-1 = 不用
     'show_recording_overlay': True,  # 录音时是否显示屏幕下方的波形浮层
     'copy_result_to_clipboard': True,  # 识别结果自动放一份进剪贴板
+    # 历史保留时长（设置面板「记录」页）：'forever'/'365'/'30'/'7'/'1'/'never'
+    # 清理在客户端启动时执行，实现见 core/client/history.py:purge()
+    'history_keep': 'forever',
 }
 EXTRA_SERVER_DEFAULTS: Dict[str, Any] = {
     # 显卡探测（实现见 core/tools/gpu_probe.py）：

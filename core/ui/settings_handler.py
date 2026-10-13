@@ -102,7 +102,8 @@ def _worker(app: Any) -> None:
         result = manager.show_dialog(
             before,
             mic_apply=lambda name: _apply_mic_now(app, name),
-            key_capture=_make_key_capture(app))
+            key_capture=_make_key_capture(app),
+            insert_text=_make_insert_text(app))
 
         if result is None or not getattr(result, 'confirmed', False):
             logger.debug('用户取消了设置面板')
@@ -175,6 +176,31 @@ def on_maybe_show_wizard(app: Any, delay: float = 3.0) -> None:
         return
     threading.Thread(target=_wizard_worker, args=(app, delay), daemon=True,
                      name='FirstRunWizard').start()
+
+
+def _make_insert_text(app: Any):
+    """
+    给「记录」页的「插入」按钮注入"打回当前光标"的能力。
+
+    设置面板（刻意）拿不到 app 对象，所以从这里绑。真正干活的是
+    `core.client.output.TextOutput.output()` —— 它是个**协程**，所以要
+    调度回 app 的事件循环；run_coroutine_threadsafe 本身不阻塞，
+    Tk 线程不会因此卡住。
+    """
+    def _insert(text: str) -> None:
+        try:
+            import asyncio
+
+            loop = getattr(app, 'loop', None)
+            output = getattr(app, 'output', None)
+            if loop is None or output is None or loop.is_closed():
+                logger.warning('插入历史文本失败：客户端输出模块不可用')
+                return
+            asyncio.run_coroutine_threadsafe(output.output(text), loop)
+            logger.info(f'历史：已把 {len(text)} 字打回当前光标')
+        except Exception as e:
+            logger.warning(f'插入历史文本失败: {e}')
+    return _insert
 
 
 def _make_key_capture(app: Any):
@@ -526,7 +552,8 @@ class _SettingsDialogManager:
                 # 设置面板也要 mic_apply —— 麦克风那一栏有「测试麦克风」，
                 # 测之前必须先把选中的设备应用上去（否则测的是旧设备）
                 dialog = SettingsDialog(self.root, request.get('mic_apply'),
-                                        request.get('key_capture'))
+                                        request.get('key_capture'),
+                                        request.get('insert_text'))
 
             # 留住实例引用，好让 focus_existing() 能把它拉到前台
             self._current_dialog = dialog
@@ -583,9 +610,11 @@ class _SettingsDialogManager:
             return False
 
     def show_dialog(self, snapshot: Dict[str, Any], timeout: float = 1800,
-                    mic_apply: Any = None, key_capture: Any = None) -> Any:
+                    mic_apply: Any = None, key_capture: Any = None,
+                    insert_text: Any = None) -> Any:
         """把快照丢给 Tk 线程，阻塞等待用户点保存/取消。"""
-        return self._show('settings', snapshot, timeout, mic_apply, key_capture)
+        return self._show('settings', snapshot, timeout, mic_apply, key_capture,
+                          insert_text)
 
     def show_wizard(self, snapshot: Dict[str, Any], timeout: float = 1800,
                     mic_apply: Any = None, key_capture: Any = None) -> Any:
@@ -593,7 +622,8 @@ class _SettingsDialogManager:
         return self._show('wizard', snapshot, timeout, mic_apply, key_capture)
 
     def _show(self, kind: str, snapshot: Dict[str, Any], timeout: float,
-              mic_apply: Any = None, key_capture: Any = None) -> Any:
+              mic_apply: Any = None, key_capture: Any = None,
+              insert_text: Any = None) -> Any:
         # 先把上一次可能残留的结果丢掉。
         #
         # result_queue 是普通的 Queue，如果某个请求因为重试/超时留下了没人取
@@ -615,6 +645,8 @@ class _SettingsDialogManager:
             payload['mic_apply'] = mic_apply
         if key_capture is not None:
             payload['key_capture'] = key_capture
+        if insert_text is not None:
+            payload['insert_text'] = insert_text
         self.request_queue.put(payload)
         logger.debug(f'对话框请求已排队（{kind}）')
         try:

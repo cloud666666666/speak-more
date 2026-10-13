@@ -149,7 +149,8 @@ class SettingsDialog:
 
     def __init__(self, parent: Optional[tk.Misc] = None,
                  mic_apply: Optional[Callable[[str], bool]] = None,
-                 key_capture: Optional[Callable[..., Any]] = None):
+                 key_capture: Optional[Callable[..., Any]] = None,
+                 insert_text: Optional[Callable[[str], None]] = None):
         """
         Args:
             parent: 父窗口
@@ -165,6 +166,7 @@ class SettingsDialog:
         self._parent = parent
         self._mic_apply = mic_apply
         self._key_capture = key_capture
+        self._insert_text = insert_text
         self.result: Optional[DialogResult] = None
         self._dialog: Optional[tk.Toplevel] = None
 
@@ -292,6 +294,14 @@ class SettingsDialog:
                 page = _ScrollFrame(nb)
                 nb.add(page, text=tab_title)
                 self._build_hotwords(page.body, snapshot)
+                continue
+
+            if tier == 'records':
+                # 「记录」页：上面是历史列表（自己画，同「热词」页的理由），
+                # 下面是保留策略（声明式字段，照常渲染）。
+                page = ttk.Frame(nb)
+                nb.add(page, text=tab_title)
+                self._build_records(page, snapshot)
                 continue
 
             groups = S.groups_in_tier(tier)
@@ -498,6 +508,32 @@ class SettingsDialog:
         row += 1
         ttk.Button(body, text='恢复默认…', command=self._on_reset).grid(
             row=row, column=0, sticky='w', padx=8, pady=(0, 16))
+
+    def _build_records(self, body: ttk.Frame, snapshot: Dict[str, Any]) -> None:
+        """
+        「记录」页：上面是识别历史列表，下面是保留策略。
+
+        对标 Typeless 的 History —— 但数据源是**我们已有的日记归档**
+        （`年份/月份/日期.md` 与 `日期-角色.md`），不新建数据格式。
+        """
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(0, weight=1)
+
+        try:
+            from core.ui.record_page import RecordPage
+            browser = RecordPage(body, insert_text=self._insert_text)
+            browser.grid(row=0, column=0, sticky='nsew', padx=4, pady=(8, 0))
+        except Exception as e:
+            logger.warning(f'历史列表加载失败: {e}')
+            ttk.Label(body, text=f'历史列表不可用：{e}', font=F_HINT,
+                      foreground=HINT_COLOR).grid(row=0, column=0, sticky='w',
+                                                  padx=8, pady=8)
+
+        holder = ttk.Frame(body)
+        holder.grid(row=1, column=0, sticky='ew', padx=8, pady=(6, 8))
+        row = 0
+        for group in S.groups_in_tier('records'):
+            row = self._build_group(holder, group, snapshot, row)
 
     def _open_logs(self) -> None:
         self._open_dir(Path(REPO_ROOT) / 'logs')

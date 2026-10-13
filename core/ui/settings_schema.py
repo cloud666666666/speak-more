@@ -301,6 +301,23 @@ GROUPS: Tuple[Group, ...] = (
 
     # 「关于」页没有字段，内容由 core/ui/settings_dialog.py 自己画：
     # 版本信息、日志路径、打开目录、恢复默认。
+    # 「记录」页只有这一个字段 —— 列表本身由 core/ui/record_page.py 自己画
+    # （历史记录是数据、不是配置项，声明式字段表表达不了）
+    Group(
+        id='records',
+        title='保留策略',
+        tier='records',
+        fields=(
+            Field('history_keep', '历史保留时长', kind='choice', default='forever',
+                  effect='restart',
+                  choices=(('永久保留', 'forever'), ('1 年', '365'), ('30 天', '30'),
+                           ('7 天', '7'), ('24 小时', '1'), ('不保留任何记录', 'never')),
+                  hint='超过这个时长的记录（连同原始录音）会在**下次启动时**自动清理；'
+                       '听写结果与 LLM 对话记录都算在内。'),
+        ),
+        note='清理是真删，删了找不回来。默认「永久保留」——'
+             '这一版不做云端同步，所有记录只在你自己的机器上。',
+    ),
     Group(id='about', title='关于', tier='about'),
 )
 
@@ -317,6 +334,7 @@ GROUPS: Tuple[Group, ...] = (
 TIERS: Tuple[Tuple[str, str], ...] = (
     ('common', '常用'),
     ('hotwords', '热词'),
+    ('records', '记录'),
     ('about', '关于'),
 )
 

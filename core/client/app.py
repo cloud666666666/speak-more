@@ -227,6 +227,16 @@ class CapsWriterClient:
         except Exception as _e:
             logger.debug(f'启动预检失败（不影响启动）: {_e}')
 
+        # [补丁] 按保留策略清理历史记录（用户在「记录」页选过"只留 7 天"之类）。
+        # 放在启动时做，而不是每条识别后做 —— 清理是低频操作，不该掺进热路径。
+        try:
+            from . import history as _history
+            _removed, _days = _history.purge(getattr(Config, 'history_keep', 'forever'))
+            if _removed:
+                logger.info(f'历史保留策略：清理了 {_removed} 条旧记录（涉及 {_days} 天）')
+        except Exception as _e:
+            logger.debug(f'历史清理失败（不影响启动）: {_e}')
+
         # [补丁] 确保服务端在跑（不在就后台拉起来）
         #
         # 用异步版本：ResultProcessor.start() 本身就是每 2 秒重试的连接循环
