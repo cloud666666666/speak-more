@@ -1,8 +1,21 @@
 # 文本拼接算法详解
 
+> **本分支补充（2026-10）**：这篇讲的是**思路**，思路没变（切片重叠 → 在 prev 尾部与 new 头部
+> 找对齐 → 在匹配点拼接）；但上游后来把实现换过了，原文里几处参数与路径已经不对：
+>
+> | 原文 | 现在 |
+> |---|---|
+> | `util/server/text_merge.py` | [`core/server/merger/text_merger.py`](../core/server/merger/text_merger.py)（`util/` 目录早改名为 `core/`） |
+> | 搜索窗口「prev 末尾 20 字」 | **前后各 100 字**（`prev[-100:]` + `new[:100]`） |
+> | `util/constants.py` 里的 `ERROR_TOLERANCE` | 常量已删，改用 `difflib.SequenceMatcher` 找最长匹配块 |
+> | 容错字符数 = 3 | 最短匹配长度 `min_match = 2`（`_find_best_overlap` 内） |
+>
+> 另外标点集合现在来自 `core/constants.py` 的 `Punctuation`，不再有独立的 `util/constants.py`。
+
+
 ## 概述
 
-[`merge_by_text`](../util/server/text_merge.py) 是 CapsWriter-Offline 中用于解决**语音切片重叠去重**的核心算法，采用**模糊文本匹配**策略，具有高鲁棒性和抗噪音能力。
+[`merge_by_text`](../core/server/merger/text_merger.py) 是 CapsWriter-Offline 中用于解决**语音切片重叠去重**的核心算法，采用**模糊文本匹配**策略，具有高鲁棒性和抗噪音能力。
 
 ## 问题背景
 
@@ -34,7 +47,7 @@
        └─> 去掉两端标点符号，保留有效文本
 
 步骤 2: 确定搜索窗口
-       └─> 在 prev_text 末尾 20 字内查找（非全文本搜索）
+       └─> 在 prev_text 末尾 100 字内查找（非全文本搜索）
 
 步骤 3: 智能匹配（两阶段）
        ├─> 阶段一：精确匹配
@@ -99,10 +112,12 @@
 
 ## 配置参数
 
-在 [`util/constants.py`](../util/constants.py) 中定义：
+（**这两条已经过时，见文首的补丁说明**）原文说它们在 `util/constants.py` 里定义：
 
-- **`OVERLAP_CHARS = 20`**: 搜索窗口大小（prev_text 末尾字符数）
-- **`ERROR_TOLERANCE = 3`**: 容错字符数（模糊匹配时允许的最大误差）
+- ~~`OVERLAP_CHARS = 20`~~：搜索窗口大小 —— 现在是**前后各 100 字**，写在
+  [`text_merger.py`](../core/server/merger/text_merger.py) 的 `merge_by_text` 里
+- ~~`ERROR_TOLERANCE = 3`~~：容错字符数 —— 这个常量**已经没有了**，改用 `difflib.SequenceMatcher`
+  找最长匹配块，最短匹配长度写死为 `min_match = 2`（在 `_find_best_overlap` 里）
 
 ## 实际应用
 
