@@ -101,11 +101,26 @@ class ShortcutManager:
             key_name = KeyMapper.vk_to_name(data.vkCode)
 
             # 防自捕获检查
+            #
+            # [补丁] 这里**刻意不动** task.pressed。
+            #
+            # 单击模式靠 task.pressed 判断"这次按下有没有松过手"（用来挡自动
+            # 重复，见 event_handler.handle_keydown）。曾经想过"被过滤掉的 keyup
+            # 也顺手把 pressed 清了，免得它卡住"，实测是错的、而且有害：
+            #   - 卡不住：被吞掉一次 keyup 最多让**下一次点击**被守卫吃掉，那一下
+            #     自己的 keyup 就把 pressed 复位了，再点一次就正常（自愈）；
+            #   - 反而有害：caps_lock 单击模式 + suppress=False 时，finish() 会在
+            #     50ms 后补发一对合成 press/release。物理 keyup 落在这个窗口里会被
+            #     这里过滤并（若同步）把 pressed 清成 False，随后到达的**合成
+            #     keydown 就穿过了守卫 → task.launch()** —— 用户明明点了"停止"，
+            #     录音却在后台悄悄重新开始（幻影会话：浮层亮着、音频在传，
+            #     下一次点击只是把它结束掉，界面看上去"点了没反应"）。
+            # 所以：过滤掉的事件对状态机完全不可见，pressed 只由真实的 keydown /
+            # keyup 维护。
             if self._check_emulating(key_name, msg):
                 return True
             if self._check_restoring(key_name, msg):
                 return True
-
             # 查找匹配的快捷键
             if key_name not in self.tasks:
                 return True

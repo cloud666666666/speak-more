@@ -751,6 +751,33 @@ class SettingsDialog:
             row=row, column=0, sticky='w', padx=8, pady=(4, 2))
         row += 1
 
+        # [补丁] 「从我的纠正里学词」开关（对标 Typeless 的 Auto-added）。
+        #
+        # 这一项由这里手工画（它属于词典区），但字段本身在 settings_schema 里
+        # 声明过，_collect() 照旧按 key 收得走 —— 所以保存流程不用动。
+        #
+        # 界面上必须把「读什么、什么时候读」说清楚：它有能力读到别的窗口里的
+        # 文字，用户有权知道边界在哪。
+        learn_var = self._new_var('bool', bool(
+            (snap.get('client') or {}).get('learn_from_corrections', True)))
+        cb = ttk.Checkbutton(body, text='从我的纠正里学词（打完字后你自己改过的地方）',
+                             variable=learn_var)
+        cb.grid(row=row, column=0, sticky='w', padx=8, pady=(0, 0))
+        self._vars['learn_from_corrections'] = learn_var
+        self._widgets['learn_from_corrections'] = cb
+        row += 1
+        ttk.Label(
+            body,
+            text=('你打完字之后如果又改了哪个词，我会「盯着那个输入框看一会儿」，'
+                  '一有变化就记进词典 —— 下次说错也照样能改对。\n'
+                  '改完立刻回车发送也没关系：输入框空了，我就用你发送前的最后样子结算。\n'
+                  '边界：只看「刚打完字」之后那一小会儿（不是常驻监控）；'
+                  '焦点跑到别的窗口就不看；只在你本机比对，不联网上传。\n'
+                  '（系统里没有无障碍接口的控件读不到，读不到就什么都不做。）'),
+            font=F_HINT, foreground=HINT_COLOR, wraplength=740,
+            justify='left').grid(row=row, column=0, sticky='w', padx=8, pady=(0, 8))
+        row += 1
+
         add_bar = ttk.Frame(body)
         add_bar.grid(row=row, column=0, sticky='ew', padx=8, pady=(0, 6))
         row += 1

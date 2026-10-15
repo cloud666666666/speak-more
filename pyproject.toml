@@ -51,6 +51,7 @@ dependencies = [
     # Windows
     "pywin32",
     "psutil",
+    "comtypes",     # UI Automation：从你的纠正里自动学词（core/tools/ui_reader.py）
 ]
 
 [dependency-groups]

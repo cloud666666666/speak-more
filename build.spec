@@ -75,6 +75,13 @@ hiddenimports += [
     'PIL',           # Pillow 用于托盘图标
     'PIL.Image',
     'pystray',       # 托盘图标库
+    # UI Automation：从你的纠正里自动学词，见 core/tools/ui_reader.py。
+    # comtypes.gen 是运行时生成的（GetModule 把 UIAutomationCore.dll 的接口
+    # 编译成 Python 模块写进这个包里），所以**不要**把它列进来 —— 列了只会
+    # 报个"找不到"的警告；真正需要的是打包时别把 comtypes 压进 archive，
+    # 这样它才有地方写。客户端已经是 noarchive=True。
+    'comtypes',
+    'comtypes.client',
 ]
 
 # # 对所有模块用 .py 源码而非 .pyc（猴子补丁 _get_module_collection_mode）

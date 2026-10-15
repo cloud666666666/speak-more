@@ -8,6 +8,14 @@ import logging
 
 from core.client.output.text_output import TextOutput
 from core.tools.asyncio_to_thread import to_thread
+# [补丁] 这个导入是**必需的**：下面出错分支里用到了 RoleConfig 常量。
+# 上游漏了这个 import（commit 069b6310 引入的），而默认角色的 name 是空串，
+# `role_config.name or RoleConfig.DEFAULT_ROLE_NAME` 会求值右边 →
+# **NameError**：原来的报错被盖掉、降级输出和错误提示都不执行，异常还会
+# 冒到 ResultProcessor.start 的接收循环里把 WebSocket 断开重连
+# （表现：默认角色配成 toast 时，每次模型调用失败都"断一次连接"）。
+# 实测复现过（logs/repro_toast_roleconfig_nameerror.py）。
+from .llm_role_config import RoleConfig
 
 logger = logging.getLogger(__name__)
 

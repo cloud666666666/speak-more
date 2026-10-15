@@ -76,6 +76,10 @@ hiddenimports += [
     'PIL.Image',
     'pystray',       # 托盘图标库
     'rich._unicode_data.unicode17-0-0',
+    # UI Automation：从你的纠正里自动学词（core/tools/ui_reader.py）。
+    # comtypes.gen 是运行时生成的，不要列（见 build.spec 里的说明）。
+    'comtypes',
+    'comtypes.client',
 ]
 
 a_2 = Analysis(

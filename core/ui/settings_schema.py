@@ -277,6 +277,11 @@ GROUPS: Tuple[Group, ...] = (
                   hint='相似度高于这个值的热词会作为上下文传给 LLM'),
             Field('hot_rule', '启用正则规则替换', 'bool', True,
                   hint='规则写在 hot-rule.txt 里'),
+            # 这一项由「热词」页的词典区手工渲染（见 settings_dialog._build_hotwords），
+            # 在这里声明是为了让 _collect() 按 key 收得到它。
+            Field('learn_from_corrections', '从我的纠正里学词', 'bool', True,
+                  hint='打完字后回读输入框，把你改过的词记进词典'
+                       '（只在本地比对，不联网；实现见 correction_learner.py）'),
         ),
         tier='advanced',
     ),

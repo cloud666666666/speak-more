@@ -58,6 +58,14 @@ EXTRA_CLIENT_DEFAULTS: Dict[str, Any] = {
     # 历史保留时长（设置面板「记录」页）：'forever'/'365'/'30'/'7'/'1'/'never'
     # 清理在客户端启动时执行，实现见 core/client/history.py:purge()
     'history_keep': 'forever',
+    # 从用户的纠正里自动学词（对标 Typeless 的 Auto-added）：
+    # 打完字之后**盯着那个输入框看一会儿**，一有改动就收进词典。
+    # 实现见 core/client/correction_learner.py，读的是焦点控件、**全程本地**。
+    'learn_from_corrections': True,
+    # 观察窗口（秒）。太短会漏掉"想一会儿再改"，太长白占一个线程。
+    # 注意：不是"隔这么久读一次" —— 窗口内会连续采样（前 8 秒每 0.25 秒一次），
+    # 因为用户常常改完立刻发送、输入框当场就空了。
+    'learn_from_corrections_window': 20.0,
 }
 EXTRA_SERVER_DEFAULTS: Dict[str, Any] = {
     # 显卡探测（实现见 core/tools/gpu_probe.py）：

@@ -21,6 +21,7 @@ import keyboard
 from . import logger
 
 from core.client.udp.udp_broadcaster import broadcast_output_udp
+from core.tools.format_tools import has_content
 from core.tools.zhconv import convert as zhconv_convert
 from core.client.audio.file_manager import AudioFileManager
 from core.client.llm.llm_write_md import write_llm_md
@@ -40,6 +41,47 @@ def _estimate_tokens(text: str) -> int:
     chinese_chars = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
     other_chars = len(text) - chinese_chars
     return int(chinese_chars / 1.5 + other_chars / 4)
+
+
+# [补丁] 识别结果里有没有"实义字符"（汉字 / 字母 / 数字）。
+# 纯标点、纯空白一律算"没有内容" —— 见 _handle_message 里那处空结果拦截。
+# 判据本体放在 core/tools/format_tools.py：llm_handler 那边（角色前缀被剥光之后的
+# 空内容）要用同一套判据，两处不能各写一份。
+_has_content = has_content
+
+
+# 录到这么久却一个字都没识别出来 → 值得提醒一次（多半是麦克风没声音）
+_SILENCE_WARN_SECONDS = 1.5
+_SILENCE_WARN_GAP = 30.0        # 两次提醒之间至少隔这么久，别刷屏
+_last_silence_warn = 0.0
+
+
+def _should_warn_silence(duration: float) -> bool:
+    """这次空结果值不值得弹提示（录得够长，且距上次提示够久）。"""
+    global _last_silence_warn
+    if (duration or 0) < _SILENCE_WARN_SECONDS:
+        return False
+    now = time.monotonic()
+    if now - _last_silence_warn < _SILENCE_WARN_GAP:
+        return False
+    _last_silence_warn = now
+    return True
+
+
+def _warn_silence() -> None:
+    """
+    提示"没听到声音"。
+
+    用作者那套 toast（自己的线程 + 自己的 Tk root），不碰主线程的 Tk。
+    弹不出来也绝不影响主流程。
+    """
+    try:
+        from core.ui.toast import toast
+        toast('🔇 没听到声音\n说了话但一个词都没识别出来，检查一下麦克风'
+              '（是不是静音了、或者输入音量被拉到 0）',
+              font_size=11, duration=6000, bg='#B45309', initial_width=0.3)
+    except Exception as e:
+        logger.debug(f'麦克风提示弹不出来（不影响使用）: {e}')
 
 
 async def _auto_enter(delay: float) -> None:
@@ -201,6 +243,34 @@ class ResultProcessor:
         if not message.is_final:
             return
 
+        # [补丁] 空结果就地丢掉，绝不往下走。
+        #
+        # 没说话 / 麦克风没声音 / 误触快捷键时，服务端会回一个空文本的最终结果。
+        # 作者原版会拿这个空字符串一路走完后面的流程 —— **包括调用 LLM 和上屏**，
+        # 于是空输入喂给润色模型，模型只能回一句"你好，请把需要校对的语音转写
+        # 文本发给我"，而这句话会被当成识别结果**打进用户正在写的文档里**；
+        # 顺带还白花一次 API 调用、写一条空日记、广播一条空 UDP、覆盖剪贴板。
+        #
+        # 实测踩到过：单击模式下按住快捷键会触发一串空会话（见
+        # core/client/shortcut/event_handler.py 的自动重复补丁），用户文档里
+        # 被塞了十几遍那句客套话。空结果没有任何可处理的内容，到此为止。
+        if not _has_content(text):
+            logger.debug('识别结果为空（没说话 / 麦克风没声音 / 误触），已忽略')
+            console.print('    [yellow]识别结果为空，已忽略（没说话？或者麦克风没声音）')
+            # [补丁] 录了挺久却一个字都没识别出来时要**说出来**。
+            #
+            # 静默丢弃会让用户以为"按了没反应、软件坏了"，而真实原因往往是
+            # 麦克风静音 / 系统把输入音量拉到 0 / 选错了设备（实测踩到：
+            # 录了 7.55 秒，音频电平每 0.5 秒都是 -95~-101 dBFS，完全是静音）。
+            # 只在这种"明显说了话却什么都没听到"的情况下提示，避免误触刷屏。
+            if _should_warn_silence(message.duration):
+                console.print('    [yellow]这次录了 '
+                              f'{message.duration:.1f} 秒却什么都没识别出来 —— '
+                              '检查麦克风是不是静音了')
+                _warn_silence()
+            self._drop_audio_file(message.task_id)
+            return
+
         # 繁体转换
         if Config.traditional_convert:
             try:
@@ -220,6 +290,21 @@ class ResultProcessor:
         # 3. 正则替换
         text = self.hotword.get_rule_corrector().substitute(text)
         hotword_elapsed = time.monotonic() - hotword_start
+
+        # [补丁] 后处理之后变成**空串**了也要丢：比如 hot-rule.txt 里有把某个
+        # 口头词整句替换成空（"[breath]" → ""）的规则。这时候上屏没有意义，
+        # 送到 LLM 那边就是"空输入"，模型照样会回一句客套话打进文档。
+        #
+        # ⚠️ 这里判的是**空串**，不是"有没有实义字符"。曾经用 _has_content 判，
+        # 结果误杀了规则替换的合法产物 —— 仓库自带的 hot-rule.txt 就有
+        # `句号 → 。`（还有 逗号/问号/回车），你说"句号"本来能打出"。"，
+        # 被那道闸静默丢掉了（回归，实测复现过）。
+        # 至于"识别结果直接就是纯标点"（单蹦一个"。"）—— 那是**第一道**闸按
+        # 原始文本拦的，这里不必重复管。
+        if not text:
+            logger.debug('识别结果经过标点清理 / 规则替换后是空的，已忽略')
+            self._drop_audio_file(message.task_id)
+            return
 
         # 保存最近一次识别结果
         self.state.last_recognition_text = text
@@ -281,6 +366,21 @@ class ResultProcessor:
             self.state.set_output_text(text)
             broadcast_output_udp(text)
 
+        # [补丁] **这一次**真正上屏的文本，后面剪贴板和「从纠正里学词」都用它。
+        #
+        # ⚠️ 千万别写成 `self.state.last_output_text or text` —— 那个字段是
+        # "最近一次**成功**上屏的文本"，LLM 失败时（认证错 / 超时 / 粘贴模式下按
+        # ESC 中断 / toast 建不出来）它**不会被刷新**，于是这里会拿到**上一次
+        # 说的那句话**：剪贴板被写成上一句，「学词」也会拿上一句去回读比对。
+        # 实测复现过三种失败场景（logs/verify_stale_last_output_text.py）。
+        #
+        # 本次自己的结果优先；LLM 那条路返回空（失败）时，屏幕上留的是原文
+        # （handle_llm_error 的 should_fallback_to_original 会补打一次原文），
+        # 所以退回 text 是对的。
+        final_text = text
+        if llm_result is not None and getattr(llm_result, 'result', ''):
+            final_text = llm_result.result
+
         # [补丁] 把结果自动放一份到剪贴板。
         #
         # 上屏是直接打到光标处的，但用户常常还想把它粘到别的地方；
@@ -291,16 +391,30 @@ class ResultProcessor:
         # 位置放在两条分支合流之后是有讲究的：
         #   - 粘贴模式下 output() 的流程是"写剪贴板 → Ctrl+V → 还原旧内容"，
         #     我们在这之后覆盖，剪贴板里留下的正好是识别结果；
-        #   - LLM 分支是 await 完的，此时 last_output_text 已经是润色后的最终文本。
+        #   - LLM 分支是 await 完的，此时 final_text 已经是润色后的最终文本。
         if getattr(Config, 'copy_result_to_clipboard', True):
             try:
                 from ..llm.llm_clipboard import copy_to_clipboard
-                final_text = self.state.last_output_text or text
                 if final_text:
                     copy_to_clipboard(final_text)
                     logger.debug(f'识别结果已复制到剪贴板（{len(final_text)} 字）')
             except Exception as e:
                 logger.debug(f'复制结果到剪贴板失败（不影响上屏）: {e}')
+
+        # [补丁] 从你的纠正里学词（对标 Typeless 的 Auto-added）。
+        #
+        # 记下刚上屏的这段文本，几秒后回读同一个输入框：如果里面还是这句话、
+        # 只是有几个词被改过，就把改动收进词典。实现见 correction_learner.py，
+        # 它起个后台线程就返回，**不给上屏这条主链路加延迟**。
+        #
+        # 传 final_text（润色后的、真正在屏幕上的那句），不是原始识别文本 ——
+        # 要比对的是屏幕上那一份。开关在设置面板「热词」页。
+        if getattr(Config, 'learn_from_corrections', True):
+            try:
+                from ..correction_learner import watch as _watch_corrections
+                _watch_corrections(final_text)
+            except Exception as e:
+                logger.debug(f'学词监视启动失败（不影响上屏）: {e}')
 
         # 保存录音与写入 md 文件
         file_audio = None
@@ -330,7 +444,28 @@ class ResultProcessor:
         self._log_modifier_key_state()
 
         console.line()
-    
+
+    def _drop_audio_file(self, task_id: str) -> None:
+        """
+        空结果早退时的收尾：把这次会话登记的录音**摘掉登记**。
+
+        [补丁] 为什么必须做：录音文件是在录音器里 create + register_audio_file
+        登记的，正常路径末尾（save_audio 那段）才会 pop 出来改名、挂进日记。
+        空结果提前 return 就永远走不到那里 —— `ClientState.audio_files` 里的
+        登记项要到程序退出才清（reset() 只在 app.stop() 时调），而磁盘上会留下
+        一个**带随机后缀、日记里没链接、记录页也看不到**的孤儿 mp3
+        （实测漏过：麦克风静音时每按一次就多一个）。
+
+        **不删文件**："识别结果为空"不等于"这段录音没用"（模型出问题时结果也是空的），
+        真要清理就在 assets/ 目录里按需删。
+        """
+        try:
+            path = self.state.pop_audio_file(task_id)
+            if path:
+                logger.debug(f'空结果：已摘掉这次录音的登记（文件保留）: {path}')
+        except Exception as e:
+            logger.debug(f'摘录音登记失败（不影响流程）: {e}')
+
     def _cleanup(self) -> None:
         """清理资源"""
         if self.state.websocket is not None:

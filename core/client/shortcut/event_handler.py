@@ -51,6 +51,17 @@ class ShortcutEventHandler:
         #
         # 改成直白的开关语义：没在录音时按下就开始（松手不停），
         # 正在录音时按下就结束并上屏。
+        #
+        # [补丁] 顺手挡掉**自动重复**，否则这个模式会自己把自己打成筛子：
+        # 按住不放时 Windows 每 ~30ms 送一次 keydown，上面那套开关语义会把
+        # 每一次重复都当成"再点一下"，于是录音以 30ms 为周期疯狂开停 ——
+        # 每个会话 0.03 秒、识别结果为空，而空结果又会一路走到 LLM 和上屏
+        # （实测：用户文档里被塞了十几遍模型的客套话）。
+        # "再点一下"本来就该靠 keyup 区分：上一次按下之后松过手，才算新的一次点击。
+        if task.pressed:
+            return
+        task.pressed = True
+
         if task.is_recording:
             task.finish()
         else:

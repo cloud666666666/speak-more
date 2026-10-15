@@ -23,6 +23,7 @@ from .llm_get_selection import get_selected_text, record_selection_usage
 from . import logger
 from .llm_stop_monitor import StopMonitor
 from core.client.udp.udp_broadcaster import broadcast_output_udp
+from core.tools.format_tools import has_content
 
 
 @dataclass
@@ -213,6 +214,21 @@ class LLMHandler:
         
         # 1. 角色检测
         role_config, content = self.detect_role(text)
+
+        # [补丁] 角色命中了、但剥掉前缀之后**没有内容** —— 那就当没命中。
+        #
+        # 用户单独说一句"翻译"/"小助理"（或者 ASR 恰好只识别出这个触发词）时，
+        # content 会被剥成空串或纯标点。原来这里直接就发请求了，等于把**空输入**
+        # 喂给大模型：模型只能回一句"请把需要翻译的文本发给我"之类的客套话，
+        # 而那句话会流进剪贴板 / LLM 归档，角色配成 typing 时**还会直接打进
+        # 用户的文档**（2026-10-14 那次"模型客套话打进文档"的事故就是这个形态）。
+        #
+        # 回落到"没匹配角色"分支：把这句话当普通听写原样上屏（说"翻译"就打出
+        # "翻译"），不花 API、不污染角色历史。
+        if role_config and not has_content(content):
+            logger.info(f'角色「{role_config.display_name}」被触发，'
+                        f'但去掉前缀后没有内容，按普通听写处理')
+            role_config = None
 
         # 2. 如果不匹配任何需要处理的角色
         if not role_config:

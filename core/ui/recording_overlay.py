@@ -1,10 +1,14 @@
 # coding: utf-8
 """
-录音状态浮层：屏幕下方一条跟着声音跳动的波形
+录音状态浮层：屏幕下方一条跟着声音起伏的**波形带**
 
 对标 Typeless 的录音反馈。作者原本的"录音中"提示只是一个控制台里的
 rich 动画（core/tools/my_status.py），而控制台是隐藏的 —— 用户按了快捷键
 之后其实**完全看不到任何反馈**，只能凭感觉。
+
+波形画法是 Pillow 渲染 + 贴到 Tk 画布上（Tk 的 Canvas 没有抗锯齿，
+直接画曲线会毛糙）。做法是**放大 3 倍绘制再缩回来**当抗锯齿，顺便拿到了
+渐变填充和柔光边缘 —— 这是"一条连续的带"，不是一排竖条。
 
 设计上的几个要点：
 
@@ -20,6 +24,8 @@ rich 动画（core/tools/my_status.py），而控制台是隐藏的 —— 用�
 
 4. 显示时机不靠在作者代码里到处插钩子，而是**轮询 app.state.recording**，
    这样只需要在音频回调里发布一下电平，改动面最小。
+
+5. Pillow 万一不可用，自动退回"一排竖条"的老画法（功能不受影响）。
 """
 
 from __future__ import annotations
@@ -38,13 +44,19 @@ except Exception:                                  # pragma: no cover
     import logging
     logger = logging.getLogger('core.ui')
 
+# 波形渲染用的图形库（项目本来就依赖 Pillow，托盘的图标就是它做的）
+try:
+    from PIL import Image, ImageDraw, ImageFilter, ImageTk
+    _HAS_PIL = True
+except Exception:                                  # pragma: no cover
+    _HAS_PIL = False
+
 # ============================================================
 #  外观参数
 # ============================================================
 
-BARS = 36                 # 波形条数
-BAR_W = 5                 # 每根宽度
-BAR_GAP = 3               # 间距
+SAMPLES = 46              # 波形保留多少个采样点（越多越细腻）
+WAVE_W = 300              # 波形带宽度（像素）
 WAVE_H = 54               # 波形最大高度（对称，上下各一半）
 PAD_X = 18
 PAD_Y = 12
@@ -60,6 +72,22 @@ HINT_FG = '#64748b'
 FRAME_MS = 55             # ≈18fps，够顺滑又不烧 CPU
 TAIL_SECONDS = 1.6        # 停止录音后再显示这么久，盖住"正在识别"
 BOTTOM_MARGIN = 110       # 距屏幕底部
+
+# ---- 波形带的外观 ----
+SS = 3                    # 超采样倍数（放大画再缩回来 = 抗锯齿）
+MIN_HALF = 1.6            # 安静时的半高（像素），保证始终是一条细线
+DENSE_PER_SEG = 5         # 每两个采样点之间插多少个点（点越密曲线越顺）
+GLOW = 7                  # 外发光半径（像素，0 = 不发光）
+WAVE_GAIN = 0.6           # 波形能长多高（1.0 = 占满 WAVE_H；越小越秀气）
+                          # 0.6 是量出来的"看得清起伏又不糊成一坨"的档位，
+                          # 想要更接近 Typeless 那种细线感就调到 0.35
+
+# 电平映射：把 RMS 折算成 0~1
+# 实测麦克风的 float32 幅度：正常说话 RMS 大概 0.02~0.06，
+# 大声 0.1+，静音 0.003 以下。按 dB 折算比线性更贴合听感。
+DB_FLOOR = -55.0          # 低于这个 dB 当作静音
+DB_CEIL = -18.0           # 高于这个 dB 当作满格
+
 
 # 电平映射：把 RMS 折算成 0~1
 # 实测麦克风的 float32 幅度：正常说话 RMS 大概 0.02~0.06，
@@ -243,7 +271,7 @@ class RecordingOverlay:
     def _build(self, root: tk.Tk) -> None:
         self.root = root
 
-        width = PAD_X * 2 + BARS * BAR_W + (BARS - 1) * BAR_GAP
+        width = PAD_X * 2 + WAVE_W
         height = PAD_Y * 2 + WAVE_H + LABEL_H
 
         win = tk.Toplevel(root)
@@ -268,12 +296,17 @@ class RecordingOverlay:
         self.canvas = canvas
         self.width = width
         self.height = height
-        self.history: Deque[float] = collections.deque([0.0] * BARS, maxlen=BARS)
+        self.history: Deque[float] = collections.deque([0.0] * SAMPLES,
+                                                       maxlen=SAMPLES)
         self.visible = False
         self._last_active = 0.0
         self._was_recording = False
         self._label = ''
         self._hint = ''
+        # 波形带的渲染缓存（渐变底和外发光图只做一次）
+        self._photo = None                 # 当前贴上去的图（必须留引用）
+        self._bg_cache = None
+        self._glow_cache = None
 
     # ---------- 每帧 ----------
 
@@ -294,7 +327,7 @@ class RecordingOverlay:
 
         # 录音开始的上升沿 -> 清空上一条波形，免得新旧混在一起
         if recording and not self._was_recording:
-            self.history = collections.deque([0.0] * BARS, maxlen=BARS)
+            self.history = collections.deque([0.0] * SAMPLES, maxlen=SAMPLES)
         self._was_recording = recording
 
         if recording:
@@ -356,20 +389,9 @@ class RecordingOverlay:
         c = self.canvas
         c.delete('all')
 
-        mid = PAD_Y + WAVE_H / 2
-        max_h = WAVE_H / 2
-        x = PAD_X
-
-        for level in self.history:
-            h = max(2.0, level * max_h)          # 至少 2px，安静时也是一条细线
-            color = BAR_LOW
-            if level > 0.66:
-                color = BAR_HIGH
-            elif level > 0.33:
-                color = BAR_MID
-            c.create_rectangle(x, mid - h, x + BAR_W, mid + h,
-                               fill=color, outline=color)
-            x += BAR_W + BAR_GAP
+        # 波形：优先画"连续的带"（对标 Typeless），Pillow 不在就退回竖条
+        if not (self._wave_supported() and self._draw_wave()):
+            self._draw_bars()
 
         y_text = PAD_Y + WAVE_H + 4
         c.create_text(PAD_X, y_text, anchor='nw', text=self._label,
@@ -379,10 +401,159 @@ class RecordingOverlay:
                           text=self._hint, fill=HINT_FG,
                           font=('Microsoft YaHei UI', 9))
 
+    # ---------- 画法一：连续的波形带 ----------
+
+    @staticmethod
+    def _wave_supported() -> bool:
+        return _HAS_PIL
+
+    def _dense_levels(self) -> List[float]:
+        """
+        把采样点插值成一条稠密的曲线（每个点的**半高**，0~1）。
+
+        用余弦插值：相邻两点之间走 S 形 —— 连线自然，又不会像三次样条那样
+        **过冲**（过冲会在安静段戳出小尖刺，看着像杂音）。
+        """
+        hist = list(self.history)
+        if len(hist) < 2:
+            return hist
+        out: List[float] = []
+        for i in range(len(hist) - 1):
+            a, b = hist[i], hist[i + 1]
+            for k in range(DENSE_PER_SEG):
+                t = k / DENSE_PER_SEG
+                out.append(a + (b - a) * (1.0 - math.cos(math.pi * t)) / 2.0)
+        out.append(hist[-1])
+        return out
+
+    def _wave_polygon(self, levels: List[float], scale: int) -> List[tuple]:
+        """由"半高序列"生成上下对称的闭合多边形（坐标已乘 scale）。"""
+        n = len(levels)
+        if n < 2:
+            return []
+        step = (WAVE_W * scale) / (n - 1)
+        mid = (PAD_Y + WAVE_H / 2) * scale
+        top, bot = [], []
+        for i, lv in enumerate(levels):
+            x = PAD_X * scale + i * step
+            h = max(MIN_HALF, lv * (WAVE_H / 2) * WAVE_GAIN) * scale
+            top.append((x, mid - h))
+            bot.append((x, mid + h))
+        return top + list(reversed(bot))
+
+    def _gradient(self, level: float):
+        """纵向渐变：上缘亮 → 中间实 → 下缘亮；主色随音量在蓝→青之间走。"""
+        key = round(level, 2)
+        if getattr(self, '_grad_key', None) == key and \
+                getattr(self, '_grad_cache', None) is not None:
+            return self._grad_cache
+
+        base = _mix_hex(BAR_MID, BAR_HIGH, key)          # 已经是 RGB 元组
+        edge = _mix_rgb(base, _hex_to_rgb('#ffffff'), 0.45)
+        h_px = (PAD_Y * 2 + WAVE_H) * SS
+        col = Image.new('RGB', (1, h_px))
+        px = col.load()
+        for y in range(h_px):
+            t = y / max(1, h_px - 1)
+            # 0 → 1 → 0 的对称权重：两头亮、中间实
+            w = abs(t - 0.5) * 2.0
+            px[0, y] = _mix_rgb(base, edge, w ** 2)
+        self._grad_cache = col.resize(
+            (self.width * SS, h_px), Image.BILINEAR)
+        self._grad_key = key
+        return self._grad_cache
+
+    def _render_wave_image(self):
+        """
+        渲染波形带的 PIL 图；画不出来返回 None。
+
+        不碰 Tk，所以可以离屏生成（自测 / 预览图就是用它出的）。
+        """
+        levels = self._dense_levels()
+        if len(levels) < 2:
+            return None
+        try:
+            W = self.width
+            H = PAD_Y * 2 + WAVE_H
+
+            if self._bg_cache is None:
+                self._bg_cache = Image.new('RGB', (W * SS, H * SS), BG)
+            img = self._bg_cache.copy()
+            poly = self._wave_polygon(levels, SS)
+
+            # 蒙版：波形带的形状
+            mask = Image.new('L', (W * SS, H * SS), 0)
+            ImageDraw.Draw(mask).polygon(poly, fill=255)
+
+            # 外发光：把蒙版模糊一圈铺一层主色（营造"在发光"的感觉）
+            if GLOW > 0:
+                glow = mask.filter(ImageFilter.GaussianBlur(GLOW * SS / 2.0))
+                glow = glow.point(lambda v: int(v * 0.5))
+                img.paste(Image.new('RGB', img.size, BAR_MID), (0, 0), glow)
+
+            # 渐变填充（按平均音量取色）+ 缩小回原尺寸 = 抗锯齿
+            mean_level = sum(levels) / len(levels)
+            img = Image.composite(self._gradient(mean_level), img, mask)
+            return img.resize((W, H), Image.LANCZOS)
+        except Exception as e:
+            logger.debug(f'波形带渲染失败: {e}')
+            return None
+
+    def _draw_wave(self) -> bool:
+        """把波形带贴到画布上。返回 False 表示没画成（调用方退回竖条画法）。"""
+        img = self._render_wave_image()
+        if img is None:
+            return False
+        try:
+            self._photo = ImageTk.PhotoImage(img)      # 必须留引用，否则不显示
+            self.canvas.create_image(0, 0, image=self._photo, anchor='nw')
+            return True
+        except Exception as e:
+            logger.debug(f'波形带贴图失败，退回竖条画法: {e}')
+            return False
+
+    # ---------- 画法二：竖条（Pillow 不可用时的兜底） ----------
+
+    def _draw_bars(self) -> None:
+        c = self.canvas
+        hist = list(self.history) or [0.0]
+        slot = WAVE_W / len(hist)
+        bar_w = max(2.0, slot * 0.62)
+        mid = PAD_Y + WAVE_H / 2
+        max_h = WAVE_H / 2
+        x = PAD_X
+        for level in hist:
+            h = max(1.5, level * max_h)
+            color = BAR_LOW
+            if level > 0.66:
+                color = BAR_HIGH
+            elif level > 0.33:
+                color = BAR_MID
+            c.create_rectangle(x, mid - h, x + bar_w, mid + h,
+                               fill=color, outline=color)
+            x += slot
+
 
 def _peak_decay(level: float) -> float:
     """轻微平滑，避免柱子闪得厉害。"""
     return max(0.0, min(1.0, level))
+
+
+# ---- 颜色小工具（画渐变用） ----
+
+def _hex_to_rgb(value: str) -> tuple:
+    v = value.lstrip('#')
+    return tuple(int(v[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def _mix_rgb(a: tuple, b: tuple, t: float) -> tuple:
+    """两个颜色按 t（0~1）混合。"""
+    t = 0.0 if t < 0 else (1.0 if t > 1 else t)
+    return tuple(int(round(a[i] + (b[i] - a[i]) * t)) for i in range(3))
+
+
+def _mix_hex(a: str, b: str, t: float) -> tuple:
+    return _mix_rgb(_hex_to_rgb(a), _hex_to_rgb(b), t)
 
 
 # ============================================================

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import time
 import uuid
 from typing import TYPE_CHECKING, Optional
 
@@ -64,6 +65,45 @@ class AudioRecorder:
         """快捷访问桥接到 app.ws"""
         return self.app.ws
     
+    def _drop_stale_blocks(self, before_time: float) -> int:
+        """
+        [补丁] 丢掉队列里时间戳早于 `before_time` 的音频块，返回丢了几块。
+
+        用途：本会话读到 finish 就退出循环了，但音频回调有可能在 finish 之后
+        又推了一块进来（松开快捷键那一瞬间的竞态）。那块音频留在**所有录音
+        会话共用的** queue_in 里，会被下一次录音当成自己的开头 —— 表现为
+        下一句开头混进上一句最后的残音。
+
+        实现细节（为什么可以直接动内部 deque）：
+          - 本函数跑在事件循环线程上，**中间没有 await**，所以这段操作是原子的；
+          - 唯一的两个入队方（音频回调 stream.py、快捷键 task.py）都是通过
+            `asyncio.run_coroutine_threadsafe` 把 put 排到同一个循环上的，
+            不存在"另一个线程正在 put"的情况；
+          - 原地过滤（而不是取出来再放回）不会打乱任何条目的顺序 ——
+            取出来再放回会把队头的东西挪到队尾，那才是真会出事。
+        """
+        queue = self.state.queue_in
+        items = getattr(queue, '_queue', None)
+        if items is None:                       # 队列实现变了就安静放弃
+            return 0
+        keep = [it for it in items
+                if not (isinstance(it, dict)
+                        and it.get('type') == 'data'
+                        and it.get('time', 0) <= before_time)]
+        dropped = len(items) - len(keep)
+        if not dropped:
+            return 0
+        items.clear()
+        items.extend(keep)
+        # 丢掉的块也要 task_done 记账，免得 queue.join() 永远等下去
+        for _ in range(dropped):
+            try:
+                queue.task_done()
+            except Exception:
+                break
+        logger.debug(f"清掉 {dropped} 块上一个会话残留的音频")
+        return dropped
+
     async def _send_message(self, message: AudioMessage) -> None:
         """发送消息到服务端"""
         if not self._ws_manager.is_connected:
@@ -109,6 +149,19 @@ class AudioRecorder:
                     logger.debug(f"录音开始，时间戳: {self._start_time}")
                     
                 elif task['type'] == 'data':
+                    # [补丁] begin 还没轮到就被数据超车时兜个底。
+                    #
+                    # queue_in 是所有录音会话共用的，会串线（上一个会话的残留、
+                    # 或者 begin 与音频数据在线程/事件循环上的排程顺序反过来）。
+                    # 那样本会话可能先收到 data，而 _start_time 还是初始的 0.0 ——
+                    # 结果这一整段录音的时间戳就是 0：音频存成
+                    # (19700101-080000).mp3，日记写进 1970/01/ 里。
+                    # 用第一块数据的时间当开始时间，误差几毫秒，总比时间戳归零好。
+                    if not self._start_time:
+                        self._start_time = task['time']
+                        logger.debug(f"未收到 begin，用第一块音频的时间作为开始: "
+                                     f"{self._start_time}")
+
                     # 在阈值之前积攒音频数据
                     if task['time'] - self._start_time < Config.threshold:
                         self._cache.append(task['data'])
@@ -152,6 +205,8 @@ class AudioRecorder:
                     asyncio.create_task(self._send_message(message))
                     
                 elif task['type'] == 'finish':
+                    # 本次会话的结束时刻（[补丁]：收尾时按它判断哪些音频块是残渣）
+                    finish_time = task.get('time') or time.time()
                     # 如果有缓存的数据未发送，先发送缓存
                     if self._cache:
                         data = np.concatenate(self._cache)
@@ -198,6 +253,17 @@ class AudioRecorder:
                         language=Config.language,
                     )
                     asyncio.create_task(self._send_message(message))
+
+                    # [补丁] 收尾：把队列里**属于本次会话之前**的残留音频丢掉。
+                    #
+                    # 松开快捷键的一瞬间，音频回调可能正好通过 state.recording
+                    # 检查、把最后一块推了进来（它排在 finish 后面）。本会话读到
+                    # finish 就 break 了，那块音频留在**所有会话共用的** queue_in
+                    # 里，下一次录音会把它当成自己的第一块发出去 —— 下一句的开头
+                    # 就会混进上一句最后 ~50ms 的残音。
+                    # 只丢"时间戳早于本次结束时刻"的块，正在路上的新会话音频
+                    # 一根汗毛都不动。
+                    self._drop_stale_blocks(finish_time)
                     break
 
         except asyncio.CancelledError:

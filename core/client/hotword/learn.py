@@ -5,9 +5,13 @@
 对标 Typeless 的 Dictionary 自动学习：*"When you correct a word after dictating,
 Typeless automatically recognizes your preferred spelling and adds the word."*
 
-我们没法去读目标应用里的最终文本（那要 UI 自动化，也违背"不偷看"的原则），
-所以把纠正入口放在**我们自己的「记录」页**：用户对着识别结果改一遍，
-我们 diff 出改动的词，问一句要不要收进词典。
+我们有两个入口，都落到这里：
+
+  1. **「记录」页的「✏️ 纠正」** —— 用户对着识别结果改一遍，我们 diff 出改动的词，
+     问一句要不要收进词典。**你改了什么我们才知道什么**，看得见、可回退。
+  2. **上屏之后的自动回读**（`core/client/correction_learner.py`）—— 走系统无障碍
+     接口（Windows UI Automation）回读刚才那个输入框，自动发现你改了什么。
+     这是 Typeless 的做法，**只在本地读、本地比对**，可以在设置里关掉。
 
 落到 hot.txt 的形态是 `正确写法 | 常见误写` —— 比 Typeless 那种"只记正确写法"
 更强：热词是用**音素**匹配别名的，所以记下"你实际会念错成什么"之后，
@@ -166,6 +170,36 @@ def _make_word(line_no: int, target: str, aliases: tuple = (), blocked: tuple = 
     return Word(line_no=line_no, target=target, aliases=aliases, blocked=blocked)
 
 
+def save_pairs(pairs: List[Tuple[str, str]]) -> dict:
+    """
+    把改动对并进 hot.txt 并落盘，返回结构化结果：
+
+        {'changed': bool,          # 有没有真的写进去（重复的改动会是 False）
+         'what': [人话说明, ...],
+         'message': 给用户看的一句话}
+
+    自动学词（core/client/correction_learner.py）用这个版本来判断"要不要弹提示" ——
+    没改动还弹"学到了"会让人以为它在瞎学。
+    """
+    from core.client.hotword import hot_file
+
+    current = hot_file.read_hot()
+    if current is None:
+        return {'changed': False, 'what': [], 'message': '读不到 hot.txt，没能保存。'}
+    new_text, what = merge_into_hot(current, pairs)
+    if not what:
+        return {'changed': False, 'what': [],
+                'message': '这些词已经在词典里了，没有改动。'}
+    if not hot_file.write_hot(new_text):
+        return {'changed': False, 'what': [], 'message': '写入 hot.txt 失败，详见日志。'}
+    return {
+        'changed': True,
+        'what': what,
+        'message': ('已加进词典：\n\n  ' + '\n  '.join(what) +
+                    '\n\n热词会在几秒内自动生效（不用重启）。'),
+    }
+
+
 def learn_and_save(pairs: List[Tuple[str, str]]) -> str:
     """
     把改动对并进 hot.txt 并落盘，返回给用户看的一句话。
@@ -175,15 +209,4 @@ def learn_and_save(pairs: List[Tuple[str, str]]) -> str:
 
     本函数只碰文件，不需要 app 对象，因此在任何界面里都能直接用。
     """
-    from core.client.hotword import hot_file
-
-    current = hot_file.read_hot()
-    if current is None:
-        return '读不到 hot.txt，没能保存。'
-    new_text, what = merge_into_hot(current, pairs)
-    if not what:
-        return '这些词已经在词典里了，没有改动。'
-    if not hot_file.write_hot(new_text):
-        return '写入 hot.txt 失败，详见日志。'
-    return ('已加进词典：\n\n  ' + '\n  '.join(what) +
-            '\n\n热词会在几秒内自动生效（不用重启）。')
+    return save_pairs(pairs)['message']

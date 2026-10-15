@@ -91,6 +91,31 @@ def _sanitize_roles(roles: Dict[str, Any],
                         f'已补占位符 {S.PLACEHOLDER_LOCAL_KEY}')
 
 
+def _hotwords_if_changed(data: Dict[str, Any],
+                         before: Optional[Dict[str, Any]]) -> Any:
+    """
+    [补丁] 取出这次提交的热词原文，**一字未改就返回 None**（让 _apply_hotwords 什么都不做）。
+
+    为什么需要这道判断：`_apply_hotwords` 是**整份写回** hot.txt 的，而「热词」页
+    在设置面板一打开时就固化了当时读到的快照。面板是刻意非模态的（可以一边开着
+    一边在别的窗口听写），于是有这段时序：
+
+        打开面板 → 听写并改一个词（自动学词往 hot.txt 追加了「老王」）
+                 → 用户没碰那一页、直接点「保存」→ 旧快照把「老王」覆盖掉 ✗
+
+    实测复现过（logs/verify_hot_clobber.py）。用户没动过那一页，就不该由它来写盘。
+    返回 None 时 _apply_hotwords 会直接返回、不碰文件。
+    """
+    hot_in = (data or {}).get('hotwords')
+    hot_before = (before or {}).get('hotwords')
+    if (isinstance(hot_in, dict) and isinstance(hot_before, dict)
+            and hot_in.get('manual') == hot_before.get('manual')):
+        logger.debug('热词表：面板里一个字没改，跳过写盘'
+                     '（避免覆盖面板开着期间后台学到的词条）')
+        return None
+    return hot_in
+
+
 def _apply_hotwords(app: Any, hot_in: Any, report: ApplyReport) -> bool:
     """
     落盘「热词」页的改动，并让它立刻生效。
@@ -216,7 +241,7 @@ def apply_result(app: Any, data: Dict[str, Any],
     # 用完即退，所以直接告诉用户「下次启动生效」。
     # 写盘部分与正常运行**完全共用**，不会出现两种模式写出不同结果。
     if app is None:
-        _apply_hotwords(None, data.get('hotwords'), report)
+        _apply_hotwords(None, _hotwords_if_changed(data, before), report)
         if client_in or roles_in or report.applied:
             report.restart.append('所有改动将在下次启动时生效')
         logger.info('独立设置模式：已落盘，不做热生效')
@@ -228,7 +253,9 @@ def apply_result(app: Any, data: Dict[str, Any],
     # 热词不属于 client 也不属于 llm_roles，用户只改了热词的话上面两个
     # diff 都是空的，会走到 `if not changed_client and not changed_roles:
     # return` —— 也就是"改了热词却什么都没发生"，而且日志上看着一切正常。
-    _apply_hotwords(app, data.get('hotwords'), report)
+    #
+    # [补丁] 但**原文一字未改时不要写盘**（见 _hotwords_if_changed）。
+    _apply_hotwords(app, _hotwords_if_changed(data, before), report)
 
     # ---------- 3) 算出哪些真的变了 ----------
     before_client = dict((before or {}).get('client') or {})

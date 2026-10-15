@@ -103,14 +103,25 @@
     - [`state.py`](core/client/state.py) - `ClientState` 共享状态
     - [`connection/websocket_manager.py`](core/client/connection/websocket_manager.py) - `WebSocketManager`
     - [`audio/`](core/client/audio/) - `AudioStreamManager` / `Recorder` / `FileManager`
+        - ⚠️ `queue_in` 是**所有录音会话共用**的：松开快捷键那一瞬间，音频回调可能把最后一块推在 `finish` 后面，本会话读不到就走了 —— 那块音频会被**下一次录音**当成自己的开头，于是下一句里混进上一句的尾音。取消路径本来就排空，**正常结束路径也要排**（`recorder._drop_stale_blocks`，按时间戳只丢早于本次结束时刻的块 —— 直接原地过滤内部 deque，取出再放回会打乱顺序）
     - [`shortcut/`](core/client/shortcut/) - `ShortcutManager`（pynput）快捷键系统
+        - ⚠️ **单击模式（`hold_mode=False`）会被按键自动重复打成筛子**：按住不放时 Windows 每 ~30ms 送一次 keydown，而"点一下开始／再点一下结束"的开关语义会把每一次重复都当成一次点击 → 录音 30ms 一开一停。挡法是 `task.pressed`（按下置位、keyup 清位，重复事件直接丢），实现在 [`event_handler.py`](core/client/shortcut/event_handler.py)
+        - ⚠️ 被 `_check_emulating` / `_check_restoring` 放行的事件也要同步 `pressed` 状态，否则 keyup 被吞一次，那个键的单击模式就永久卡在"按过了"
     - [`output/result_processor.py`](core/client/output/result_processor.py) - `ResultProcessor` 后处理核心
+        - ⚠️ **空的识别结果必须就地丢掉**（`_has_content` = `format_tools.has_content`）：作者原版会拿空字符串一路走到 LLM 和上屏 —— 空输入喂给润色角色，模型回一句"你好，请把需要校对的语音转写文本发给我"，**这句话会被当成识别结果打进用户正在写的文档里**（实测被塞了十几遍）。两道闸分工不同：**第一道**判「有没有实义字符」（原始文本，拦 ASR 直出的纯标点），**第二道**判「是不是空串」（后处理产物可以是合法的纯标点 —— hot-rule.txt 自带 `句号 → 。`，用 `_has_content` 判会把它误杀，踩过）
+        - ⚠️ **`state.last_output_text` 是"最近一次成功上屏的文本"，不是"本次"**：LLM 失败（认证 / 超时 / 按 ESC / toast 建不出来）时它**不刷新**，拿 `last_output_text or text` 当本次结果 → 剪贴板被写成上一句话、学词也会拿上一句去回读比对（实测复现：logs/verify_stale_last_output_text.py）。本次结果要从 `llm_result.result` 取，取不到退回 `text`
+        - ⚠️ 两处空结果早退都要先 `_drop_audio_file(task_id)`：录音文件在录音器里登记过，正常路径末尾才 pop 出来改名挂进日记，早退就漏成"随机后缀的孤儿 mp3 + 一直不释放的登记项"
     - [`output/text_output.py`](core/client/output/text_output.py) - `TextOutput` 上屏
     - [`hotword/`](core/client/hotword/) - 热词系统（Phoneme RAG + Rule + Rectification）
         - [`hot_file.py`](core/client/hotword/hot_file.py) - hot.txt 读写 + 体检(lint) + 词条级增删改 / CSV 导入
-        - [`learn.py`](core/client/hotword/learn.py) - 从用户纠正里学词条（对齐 diff 后并进 hot.txt）
+        - [`learn.py`](core/client/hotword/learn.py) - 改动 diff → 词条（`diff_words` / `save_pairs`）；手动纠正与自动学词共用
+    - [`correction_learner.py`](core/client/correction_learner.py) - **从你的纠正里自动学词**：上屏后**盯着那个输入框看一会儿**（默认最多 20s，前 8s 每 0.25s 采样），一有变化就学；**输入框空了就用最后看到的内容结算**（对标 Typeless 的 Auto-added）。四道闸：同一个控件 / 原话还在 / 只认小幅替换 / **读音对得上**
+        - ⚠️ **必须是连续采样，不能"隔几秒读一次"**：用户常常改完立刻回车发送，输入框当场就空了，隔几秒再读只能读到空白、改动永远学不到（实测丢过）。"空"这个信号**只在已经见过我们那句话之后**才算结束 —— 刚上屏那会儿输入框本来就是空的
+        - ⚠️ 判"是不是听错了一个词"**不能靠改动长度**：difflib 会把"你把半句话重写了"拆成好几个**短**替换（实测 `周三→周五`、`接口文档→验收报告`、`给我→给他们`，每段才 2~4 字），长度和条数都拦不住。拦得住的是**读音** —— 中文比 `algo_phoneme.get_phoneme_seq` 的音素序列（去掉声调，`老汪→老王` 这种正是要认的），英文只认错一两个字母
     - [`history.py`](core/client/history.py) - 识别历史：解析日记归档（听写 / LLM 对话）、搜索、精确删除、保留策略
     - [`llm/`](core/client/llm/) - LLM 子系统（角色加载、上下文、API 调用）
+        - ⚠️ **别把空内容发给模型**：空输入只会换回一句客套话，而那句客套话会进剪贴板 / LLM 归档，角色配成 typing 时**直接打进用户文档**。两个已知入口都要拦：识别结果为空（见上）、以及**角色前缀把整句吃掉之后**（用户单独说"翻译"/"小助理"，`detect_role` 剥完前缀 content 是空的 → 会被当成"没匹配角色"按普通听写处理）
+        - [`llm_get_selection.py`](core/client/llm/llm_get_selection.py) - 取「选中的文字」。**无障碍接口优先**（不发按键、不碰剪贴板，还能区分"没选中"和"读不了"），读不了才退回模拟 Ctrl+C，**且终端窗口里绝不退回** —— 那里 Ctrl+C 是 SIGINT，会打断前台跑着的进程
     - [`manager/`](core/client/manager/) - `MicRunner` / `FileRunner` / `TrayManager`
     - [`transcribe/`](core/client/transcribe/) - `FileTranscriber` 文件转录
     - [`diary/diary_writer.py`](core/client/diary/diary_writer.py) - `DiaryWriter` 日记归档
@@ -119,11 +130,16 @@
     - [`model_precheck.py`](core/client/model_precheck.py) - 启动预检：缺模型 / 缺 DLL 时弹窗说清
     - [`standalone_settings.py`](core/client/standalone_settings.py) - `--settings` 独立设置模式（托盘坏掉时的逃生通道）
     - [`settings_apply.py`](core/client/settings_apply.py) - 设置落盘 + 热生效（`apply_result`，`app=None` 即独立模式）
+        - ⚠️ **热词表是整份写回的**：设置面板一打开就固化了当时的 hot.txt 快照，保存时无条件写盘会把**面板开着期间由别处产生的改动**抹掉（自动学词就是那个"别处"）。所以 `_hotwords_if_changed()` 在原文一字未改时返回 None、跳过写盘（实测复现：logs/verify_hot_clobber.py）
 - **共享工具**: [`core/tools/`](core/tools/) — ITN、格式化、信号处理、窗口检测、简繁转换
     - [`paths.py`](core/tools/paths.py) - `install_root()`：程序根目录。**别自己写 `Path(__file__).resolve()`** —— 打包时 `core/` 是目录联接，`resolve()` 会把它展开成源码树的路径（实测坑过四处：孤儿清理、打开日志目录、热词表、显卡缓存）
     - [`model_paths.py`](core/tools/model_paths.py) - 模型 / llama.cpp DLL 路径表 + 缺失检查（客户端与服务端共用同一份判断）
     - [`gpu_probe.py`](core/tools/gpu_probe.py) - 显卡探测 + 后端选择 + **验活**（onnxruntime 会静默回落到 CPU，只查 provider 列表不算数）
+    - [`ui_reader.py`](core/tools/ui_reader.py) - 用 Windows UI Automation 读**焦点输入框里的文本**（`read_focused_text` / `focused_info`）和**选中的文字**（`read_selection`，三态：`None`=控件读不了 / `''`=确实没选中 / 非空=选中内容）。依赖 `comtypes`；只在本地读、只在刚上屏后的几秒读一次；控件不给读就返回 None，**不做任何降级**（不截图、不翻剪贴板、不模拟键盘）
+        - ⚠️ `read_selection` 里有一道自检：某些控件会把**整篇文档**当成"选中内容"报上来（实测没获得焦点的记事本 RichEdit 就这样）—— 信了它就会把整篇文档塞进提示词。所以"选区 == 整框文本"时一律按"没选中"处理
 - **UI 组件**: [`core/ui/`](core/ui/) — Toast、Tray、对话框、**设置面板**（[`settings_dialog.py`](core/ui/settings_dialog.py) + [`settings_handler.py`](core/ui/settings_handler.py) + [`settings_schema.py`](core/ui/settings_schema.py)，列表类页面自己画：热词/词典页、[`record_page.py`](core/ui/record_page.py) 记录页）、首启向导、按键捕获、录音浮层、图标统一（[`app_icon.py`](core/ui/app_icon.py)）
+    - [`recording_overlay.py`](core/ui/recording_overlay.py) - 录音浮层：屏幕下方一条跟着声音起伏的**波形带**（对标 Typeless）。画法是 **Pillow 离屏渲染再贴到 Tk 画布**（Tk 没有抗锯齿，直接画曲线会毛糙；放大 3 倍画再缩回来当抗锯齿）。外观旋钮都在文件头部：`WAVE_GAIN`（波形长多高，0.6 = 现在这档）、`GLOW`（外发光）、`SAMPLES`（采样点）、`DB_FLOOR`/`DB_CEIL`（电平映射）。**Pillow 不在时有竖条兜底**；渲染失败只写 debug 日志、绝不影响录音
+        - 出预览图：`logs/_verify_overlay_wave.py`（离屏渲染，会写 `logs/overlay_wave_preview.png` + `.gif`），调外观时先看它、别每次去录音试
     - ⚠️ **工作线程不能碰 Tk**（连 `after()` 都不行）：对话框打开时（主线程在 `wait_window`）会卡住或抛 `RuntimeError: main thread is not in main loop`，异常被 `except` 吞掉后表现就是"点了没反应"（测试麦克风 / 测试连接都中过招）。回传结果用 [`dialogs.py`](core/ui/dialogs.py) 的 `ThreadSlot` + `poll_slot`
 - **协议**: [`core/protocol.py`](core/protocol.py) — `AudioMessage` + `RecognitionMessage`
 - **日志**: `logs/client_latest.log` & `logs/server_latest.log`（排查问题唯一入口）
@@ -140,6 +156,10 @@
 - ⚠️ **不要排除 `internal/*.pyc`** —— noarchive 模式下整个运行时就是松散的 .pyc（近 5000 个），
   排掉之后 exe 会报 `Failed to import encodings module` 起不来。
 - ⚠️ PyInstaller 按 **exe 自己所在的目录**找 `internal/`，所以 `start_server.exe` 挪不进子目录。
+- 客户端比上游多一个依赖 **comtypes**（UI Automation，见 [`ui_reader.py`](core/tools/ui_reader.py)），
+  两个 spec 的 `hiddenimports` 都已列上。**`comtypes.gen` 是运行时生成的**（`GetModule()` 把
+  `UIAutomationCore.dll` 的接口编译成 .py 写进那个包），所以别把它写进 hiddenimports ——
+  需要的是别把 comtypes 压进 archive（客户端本来就是 `noarchive=True`），另外安装目录得可写。
 
 ## 模型支持 (Models)
 
