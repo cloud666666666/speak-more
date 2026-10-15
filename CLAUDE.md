@@ -18,7 +18,8 @@
 - **配置化**: [`config_client.py`](config_client.py) / [`config_server.py`](config_server.py) 及 `hot*.txt`、[`LLM/*.py`](LLM/) 位于根目录。
   **本分支的运行时配置不回写这些文件**：设置走 [`config_local.py`](config_local.py) 的
   `config_local.json` 覆盖层，优先级 = 源码默认 < 补丁默认(`PATCH_*`) < JSON。
-- **版本**: 上游内核 v2.6；本分支外壳 v0.1（2026-10-13 首发）
+- **版本**: 上游内核 v2.6；本分支外壳 **v0.2**（2026-10-15；v0.1 首发于 2026-10-13）
+  发行版与说明见 <https://github.com/cloud666666666/speak-more/releases>
 
 ## 架构细节与流程 (Architecture & Workflows)
 
