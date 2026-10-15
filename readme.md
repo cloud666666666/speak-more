@@ -72,7 +72,9 @@
 运行时配置**不回写上游源码** —— 所有设置走 `config_local.json` 覆盖层
 （见 [`config_local.py`](config_local.py) 的文件头说明），`LLM/*.py` 里的角色文件你可以随便改、
 升级不会覆盖。相对上游基线（`84912d5`）：**30 多个上游文件被改、30 多个新文件**，合计一万多行；**识别内核（`core/server/engines/`、
-`core/server/merger/`、`core/protocol.py`）一行未改**，每处外壳改动都带 `[补丁]` 注释说明原因。
+`core/server/merger/`、`core/protocol.py`）的**功能代码一行未改** ——
+`merger/`、`protocol.py` 完全没动，`engines/` 只删掉了 8 个确认没人引用的死文件（旧实现、死门面、废弃的 worker 残留，共 787 行）。
+每处外壳改动都带 `[补丁]` 注释说明原因。
 
 ### 关于「自动学词」读了什么
 
