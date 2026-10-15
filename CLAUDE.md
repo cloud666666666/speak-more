@@ -186,6 +186,20 @@
 - **Punct-CT-Transformer**: 标点模型（`CTTransformerPuncEngine`），引擎无 PUNC 能力时自动加载。
 - **QwenForceAligner**: 对齐器（`ManagedAlignerProxy` 延迟加载+闲置卸载），用于文件转录时间戳对齐。
 
+### 模型导出工具链在哪（本仓库**不带**）
+`core/server/engines/*/export/` 曾经放过四份导出工具链的快照（约 80k 行），
+2026-10-15 已删 —— 它们在本仓库里**运行时零引用**（`models/` 的笔记本也不用它们），
+而正主是上游作者另外几个独立仓库（编号脚本流水线，随时可去拿）：
+
+| 造什么 | 去哪 |
+|---|---|
+| Qwen3-ASR 的 encoder/decoder + 对齐器 | <https://github.com/HaujetZhao/Qwen3-ASR-GGUF>（`00-`～`17-` 编号脚本） |
+| Fun-ASR-Nano 的 ONNX + GGUF decoder | <https://github.com/HaujetZhao/Fun-ASR-GGUF>（`01-`～`06-`） |
+| SenseVoice 的 ONNX encoder/CTC | <https://github.com/HaujetZhao/SenseVoice-ONNX>（`01-`～`17-`） |
+
+也就是说：**用户拿到的模型是那几个仓库的产物**，本仓库只负责跑推理。
+想重新导出/量化模型就去上面那几个仓库，别在本仓库里找。
+
 ### 引擎能力检测
 引擎通过 `EngineCapabilities` 标志位声明能力（`ASR` / `PUNC` / `TIMESTAMPS` / `STREAMING` / `HOTWORDS`）。`ModelLoader` 在加载时智能补丁：若引擎缺少 `PUNC` 则外挂标点模型，若缺少 `TIMESTAMPS` 则外挂对齐器。
 
