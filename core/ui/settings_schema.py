@@ -4,7 +4,9 @@
 
 这一份表被三个地方共享：
   1. 托盘里的 ⚙️ 设置面板（core/ui/settings_dialog.py）
-  2. 独立的「CapsWriter设置.exe」（逃生通道，托盘不可用时用）
+  2. **独立设置模式** `Speak More.exe --settings`（逃生通道，托盘不可用时用；
+     源码形态是 `python start_client.py --settings`）。注意**没有**单独的
+     「CapsWriter设置.exe」—— 那个入口早就并进主 exe 了
   3. 安装向导的高级初始配置页
 
 所以**必须只依赖标准库**，不能 import config_client / core.*。

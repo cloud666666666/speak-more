@@ -112,21 +112,30 @@ def required_model_files(model_type: str) -> Optional[Tuple[Path, List[Path]]]:
 
 
 # ============================================================
-#  llama.cpp 的 DLL：每个引擎各自从自己的 inference/bin 加载
+#  llama.cpp 的 DLL：三个 GGUF 引擎共用**同一份**
 # ============================================================
 
-# 注意：core/server/engines/llama/bin 是**历史遗留**，现在的引擎只从各自的
-# inference/bin 加载（每个 *_gguf/inference/llama.py 里写死了 Path(__file__).parent/'bin'），
-# 没有回退路径。上游文档里还写着往 engines/llama 里替换 DLL，那是旧版本的说明。
-_ENGINE_DLL_DIRS = {
-    'qwen_asr': 'core/server/engines/qwen_asr_gguf/inference/bin',
-    'fun_asr_nano': 'core/server/engines/fun_asr_gguf/inference/bin',
-    'paraformer': None,          # 走 sherpa_onnx，不用这套 DLL
-    'sensevoice': None,          # 同上（ONNX 推理）
-}
+# 实测（logs/_probe_engine_llama_bind.py）：
+#
+#     core/server/engines/qwen_asr_gguf/inference -> engines/llama/llama.py
+#     core/server/engines/fun_asr_gguf/inference  -> engines/llama/llama.py
+#     core/server/engines/force_aligner_gguf/inference -> engines/llama/llama.py
+#
+# 机理是三个 `inference/__init__.py` 里都写了 `try: from ...llama import llama`：
+# 共享那份一旦绑成包属性，后面 `from . import llama` 拿到的就是**它**，
+# 而不是同目录下那个 llama.py。运行时日志也印证了同一件事：
+#     "初始化 llama.cpp，跳转至：…\core\server\engines\llama\bin"
+#
+# 所以 DLL 只需要装在**这一个**目录里。对齐器（force_aligner_gguf）也一样。
+#
+# ⚠️ 各引擎自带的 `*_gguf/inference/bin/` 是**旧版说明**的产物：只有它们自己那份
+# llama.py 副本会去读，而那份是按 b10621 之前的 ABI 写的（把 llama_context_params
+# 读成 136 字节、真实 160 → n_threads=0、rope_freq_base=nan）。那条路根本不该走，
+# 别往那儿装 DLL（装了也不生效）。zip_release.py 现在也只发共享这一份。
+LLAMA_DLL_DIR = 'core/server/engines/llama/bin'
 
-# 对齐器（文件转录用）也走 GGUF，需要它自己的那一份
-ALIGNER_DLL_DIR = 'core/server/engines/force_aligner_gguf/inference/bin'
+# 不装这套 DLL 的引擎（走 sherpa_onnx / 纯 ONNX 推理）
+_NO_LLAMA_ENGINES = ('paraformer', 'sensevoice')
 
 # 三个必装的库文件（缺一个 llama.cpp 都起不来）
 REQUIRED_LLAMA_DLLS = ('ggml.dll', 'ggml-base.dll', 'llama.dll')
@@ -134,11 +143,9 @@ REQUIRED_LLAMA_DLLS = ('ggml.dll', 'ggml-base.dll', 'llama.dll')
 
 def required_dll_dirs(model_type: str) -> List[str]:
     """返回该模型类型下必须齐备的 DLL 目录（相对安装目录）。"""
-    dirs: List[str] = []
-    d = _ENGINE_DLL_DIRS.get((model_type or '').lower())
-    if d:
-        dirs.append(d)
-    return dirs
+    if (model_type or '').lower() in _NO_LLAMA_ENGINES:
+        return []
+    return [LLAMA_DLL_DIR]
 
 
 # ============================================================
@@ -191,7 +198,7 @@ def find_missing_models(model_type: str) -> Dict[str, Any]:
 
 def find_missing_dlls(model_type: str, root: Optional[Path] = None) -> List[str]:
     """
-    核对 llama.cpp 的 DLL 是否齐备（每个引擎从各自的 inference/bin 加载）。
+    核对 llama.cpp 的 DLL 是否齐备（三个 GGUF 引擎共用 engines/llama/bin）。
 
     root 传安装目录；不传就按相对路径检查（依赖 cwd 已是安装目录）。
     返回缺失文件的说明串列表（空 = 没问题）。

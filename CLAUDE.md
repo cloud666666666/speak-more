@@ -5,7 +5,7 @@
 > 改动集中在外壳层，每处都带 `[补丁]` 注释说明原因。
 >
 > 与上游的关系：合并基线是上游的 `84912d5`（2026-09-14），
-> `git diff 84912d5..HEAD` 就是本分支的全部差异（40+ 文件、+9000 行左右）。
+> `git diff 84912d5..HEAD` 就是本分支的全部差异（30 多个上游文件被改、30 多个新文件，合计一万多行）。
 
 ## 核心设计 (Core Design)
 **"快、准、稳、离线"**
@@ -79,11 +79,11 @@
     - [`hot-rule.txt`](hot-rule.txt) - 规则替换
     - [`hot-server.txt`](hot-server.txt) - 服务端热词
 - **LLM角色**: [`LLM/*.py`](LLM/) (根目录, 定义 Role/Prompt/Model)
-    - [`default.py`](LLM/default.py) - 默认角色（热词、润色，process=False）
-    - [`翻译.py`](LLM/翻译.py) - 翻译角色（ollama/gemma3:12b）
-    - [`高级翻译.py`](LLM/高级翻译.py) - 高级翻译（deepseek/deepseek-chat）
-    - [`大助理.py`](LLM/大助理.py) - 大助理（zhipu/glm-4.5-air）
-    - [`小助理.py`](LLM/小助理.py) - 小助理（lmstudio/local-model）
+    角色开关字段叫 **`enabled`**（不是 `process`/`match` —— 上游早期的文档里是那两个名字，早改了）
+    - [`default.py`](LLM/default.py) - 默认角色（润色）。`enabled = False`：它不是"靠前缀触发"的角色，普通听写走的就是它
+    - [`翻译.py`](LLM/翻译.py) - 翻译角色（lmstudio / local-model）
+    - [`大助理.py`](LLM/大助理.py) - 大助理（deepseek / deepseek-v4-flash）
+    - [`小助理.py`](LLM/小助理.py) - 小助理（lmstudio / local-model）
 - **服务端核心**: [`core/server/`](core/server/)
     - [`app.py`](core/server/app.py) - `CapsWriterServer` 门面类
     - [`state.py`](core/server/state.py) - `ServerState` / `WorkerState` 共享状态
@@ -160,6 +160,14 @@
   两个 spec 的 `hiddenimports` 都已列上。**`comtypes.gen` 是运行时生成的**（`GetModule()` 把
   `UIAutomationCore.dll` 的接口编译成 .py 写进那个包），所以别把它写进 hiddenimports ——
   需要的是别把 comtypes 压进 archive（客户端本来就是 `noarchive=True`），另外安装目录得可写。
+- ⚠️ **llama.cpp 的绑定与 DLL：三个 GGUF 引擎共用 `core/server/engines/llama/`，不是各自的 `inference/bin/`**。
+  机理：三个 `inference/__init__.py` 都写 `try: from ...llama import llama`，包属性一旦绑上，
+  后面 `from . import llama` 拿到的是共享那份；运行时日志会打「初始化 llama.cpp，跳转至：…\engines\llama\bin」。
+  实测：`logs/_probe_engine_llama_bind.py`（绑定归属）、`logs/_probe_llama_abi.py` vs `_probe_llama_shared_abi.py`（新旧绑定的 ABI）。
+  **各引擎自带的 `inference/llama.py` 是旧版**（把 `llama_context_params` 读成 136 字节、真实 160 → `n_threads=0`、`rope_freq_base=nan`），
+  只在那条共享 import 失败时才会用到 —— 别去"修"它，也别把 DLL 装到 `inference/bin/`。
+  `zip_release.py` 据此：**发** `engines/llama/`（共享绑定 + 一份 DLL）、**不发**三个 `inference/bin/` 的 DLL 副本（省 ~190MB）。
+  2026-10-15 之前这里是反的，v0.1 发行包因此跑的正是那份错位的旧绑定（`logs/_verify_zip_rules.py` 现在会守住这条）。
 
 ## 模型支持 (Models)
 

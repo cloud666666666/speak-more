@@ -17,7 +17,8 @@
     全部排除。这里改成明确的规则。
 
 默认**不打包 models/**（2GB 量级，而且用户要按自己选的引擎下载），
-但**打包引擎的 llama.cpp DLL** —— 缺了它程序根本起不来，而它只有约 95MB×3。
+但**打包引擎的 llama.cpp DLL** —— 缺了它程序根本起不来。只需一份
+（core/server/engines/llama/bin/，三个引擎共用同一套 DLL，详见 EXCLUDE_PREFIXES 的注释）。
 
 用法：
     python zip_release.py                    # 打包 dist 下所有存在的发行包
@@ -53,11 +54,28 @@ EXCLUDE_DIRS = {
 }
 
 # 整棵子树排除（相对包根目录的路径前缀）
-#   core/server/engines/llama/ —— 历史遗留目录，没有任何代码引用它
-#   （每个引擎只从自己的 `*_gguf/inference/bin` 加载 DLL，无回退路径），
-#   而它带着一份 95MB 的 DLL，四个目录里那份还完全相同。不发。
+#
+# [补丁] 这里**不能**排除 core/server/engines/llama/ —— 早先的注释写它是
+# "历史遗留目录，没有任何代码引用它"，**是错的**，实测（logs/_probe_engine_llama_bind.py）：
+# 三个 GGUF 引擎的 `inference/__init__.py` 都写了 `try: from ...llama import llama`，
+# 包属性一旦绑上，后面 `from . import llama` 拿到的是**共享那份**（见
+# core/server/engines/*/inference/__init__.py）。也就是说源码运行时用的是
+# engines/llama/，而不是各引擎自带的那份。
+#
+# 两边版本还不一样，后果很严重：各引擎自带的 llama.py 是**旧的**（35935 字节），
+# 按 b10621 的 DLL 读它会把 llama_context_params 当成 136 字节（真实 160），
+# 字段整体错位 —— 实测读出 n_threads=0、rope_freq_base=nan。源码跑共享版没事，
+# 而发行包把共享版排掉了 → **发布版跑的就是这份错位的绑定**（v0.1 就是这么发出去的）。
+#
+# 所以现在的规则反过来：
+#   - **发** core/server/engines/llama/（共享绑定 + 一份 DLL）
+#   - **不发** 三个引擎各自 inference/bin 里的 DLL 副本 —— 它们只有那份旧绑定
+#     会去读（共享绑定读的是自己旁边的 bin），排除掉省 ~190MB
+# 三个引擎各自的 DLL 集合与共享那份完全相同，一份够用。
 EXCLUDE_PREFIXES = (
-    'core/server/engines/llama/',
+    'core/server/engines/qwen_asr_gguf/inference/bin/',
+    'core/server/engines/fun_asr_gguf/inference/bin/',
+    'core/server/engines/force_aligner_gguf/inference/bin/',
 )
 
 # 顶层目录名形如 4 位年份的，是**日记归档**（使用记录 + 录音），
@@ -78,7 +96,12 @@ EXCLUDE_NAMES = {
 # 松散的 .pyc 放在 internal/ 里（本包有近 5000 个），少一个都起不来
 # （实测：排掉之后 exe 报 "Failed to import encodings module"）。
 # 源码树里的缓存垃圾由上面 __pycache__ 那条目录规则挡掉。
-EXCLUDE_SUFFIXES = ('.tmp', '.pretest')
+#
+# [补丁] 顺手挡掉所有 `.bak`：热词表写盘时会生成 `hot.txt.bak`
+# （hot_file.py 的原子写），而排除名单里原先只有 config_local.json.bak，
+# 于是**热词备份会被打进发行包**（合成目录自测抓到的，logs/_verify_zip_rules.py）。
+# 它是构建机上的本地残留，对新用户毫无意义。
+EXCLUDE_SUFFIXES = ('.tmp', '.pretest', '.bak')
 
 
 def should_skip(rel: Path, with_models: bool) -> bool:

@@ -1,3 +1,8 @@
-# 指定所有 .bat 文件在提交时将 LF 转换为 CRLF
-*.bat text eol=crlf
+# 换行符统一为 LF（仓库里和工作区里都是）。
+#
+# 这里**不要**再写 `*.bat text eol=crlf` —— 它会被下面那行通用规则覆盖
+# （gitattributes 后匹配的行优先），名不副实、反而误导。
+# 实测四个 .bat 现在就是 LF 跑的：`git check-attr eol -- <bat>` = lf，
+# 本机天天在用没出过问题（也没有 goto/label 这类对 CRLF 敏感的写法）。
+# 真需要 CRLF 时：把通用行挪到前面、bat 那行放最后。
 * text=auto eol=lf

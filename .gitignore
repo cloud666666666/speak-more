@@ -30,6 +30,10 @@ MANIFEST
 # 通常这些文件由脚本生成，可能包含本地路径
 *.manifest
 *.spec
+# 但这两个是仓库的一部分，必须跟踪（ignore 不影响的已跟踪文件；
+# 这两行是防"删掉后重新 add 被静默忽略"的呆）
+!build.spec
+!build-client.spec
 *.zip
 
 # 安装日志
@@ -149,12 +153,12 @@ cython_debug/
 models/*/*/
 models/*.py
 
-# 日志与按年归档的文件夹（如 2026/01/...）
-20*/
-
-# 同一类，但年号是 19xx 的：时间戳归零时会往 1970/ 里写日记
-# （2026-10 踩过一次 —— 那次 begin 被音频数据超车，time_start 成了 0）
-19*/
+# 按年归档的日记目录（如 2026/01/...）
+#
+# 用四位数年份来匹配，不用 `20*/` —— 后者盖不住 1970/ 这种：
+# 2026-10 踩过一次，那次 begin 被音频数据超车、time_start 成了 0，
+# 日记写进 1970/01/，而它是**未跟踪又未被忽略**的，add -A 就会推到公开仓库。
+[12][0-9][0-9][0-9]/
 
 # 日志文件夹（包含 server_*.log 和 client_*.log）
 logs/
@@ -205,10 +209,13 @@ config_local.json.bak
 config_local.json.bak.*
 config_local.json.tmp
 
-# 热词表写入时留的备份（hot.txt 本身是跟踪的，模板要跟着仓库走）
+# 原子写留下的备份（hot.txt 本身是跟踪的，模板要跟着仓库走）
 hot.txt.bak
 hot-rule.txt.bak
 *.tmp
+# 通用备份后缀：上游曾把一个 core/client/shortcut/shortcut_manager.py.bak
+# 误传进仓库跟了好几年（2026-10-15 清掉），用这条兜住同类
+*.bak
 
 # Windows 杂物
 Thumbs.db

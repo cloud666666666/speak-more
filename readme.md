@@ -30,7 +30,7 @@
 <https://github.com/HaujetZhao/CapsWriter-Offline/releases/tag/models>
 
 > 想省 1.5GB 可以换 SenseVoice（413MB），改 `config_local.json` 的 `server.model_type`，
-> 详见 [`docs/识别语言如何配置.md`](docs/识别语言如何配置.md)。
+> 详见 [`docs/模型下载的若干问题.md`](docs/模型下载的若干问题.md)。
 
 ---
 
@@ -41,7 +41,7 @@
 | **按住说话** | 长按快捷键录音、松开上屏；也可以设成**点一下开始 / 再点一下结束**。键盘任意键、鼠标侧键都能当快捷键 |
 | **实时的波形浮层** | 屏幕下方一条跟着声音起伏的波形带（对标 Typeless），让你知道"它在听"、麦克风有没有声音。**不抢焦点、鼠标穿透** |
 | **LLM 润色 / 角色** | 识别结果先过大模型：去口水词、修错别字、补标点。还能配**角色** —— 说「翻译 xxx」走翻译角色、说「小助理 xxx」走助理角色，每个角色独立的提示词、模型、输出方式 |
-| **热词 + 词典** | 你的人在、公司名、项目代号写进词典，识别时按**读音**模糊匹配纠正（念错也能纠回来）。词典可以在设置面板里逐条增删、**从 CSV 导入** |
+| **热词 + 词典** | 你的人名、公司名、项目代号写进词典，识别时按**读音**模糊匹配纠正（念错也能纠回来）。词典可以在设置面板里逐条增删、**从 CSV 导入** |
 | **自动学词** | 你打完字之后自己改过的词，它会盯着那个输入框看一会儿、**一有变化就收进词典** —— 改完立刻回车发送也没关系，用你发送前的最后样子结算（对标 Typeless 的 Auto-added） |
 | **记录页** | 听写与 LLM 对话的历史归档，能搜索、能逐条复制 / 打回光标 / 放原始录音 / 删除；保留时长可选 |
 | **文件转录** | 拖入音视频文件 → 出 `.srt` / `.txt` / `.json` |
@@ -71,8 +71,7 @@
 
 运行时配置**不回写上游源码** —— 所有设置走 `config_local.json` 覆盖层
 （见 [`config_local.py`](config_local.py) 的文件头说明），`LLM/*.py` 里的角色文件你可以随便改、
-升级不会覆盖。相对上游基线（`84912d5`）：**64 个文件、+11195 / −815**，
-其中 32 个是上游文件、32 个是本分支新增；**识别内核（`core/server/engines/`、
+升级不会覆盖。相对上游基线（`84912d5`）：**30 多个上游文件被改、30 多个新文件**，合计一万多行；**识别内核（`core/server/engines/`、
 `core/server/merger/`、`core/protocol.py`）一行未改**，每处外壳改动都带 `[补丁]` 注释说明原因。
 
 ### 关于「自动学词」读了什么
@@ -105,14 +104,22 @@ python start_client.py
 还需要两样上游要求的东西（仓库里不带）：
 
 - **llama.cpp 的 DLL**（`ggml.dll` / `ggml-base.dll` / `llama.dll` 加后端 DLL）：
-  每个引擎从**自己的** `inference/bin` 加载，中间没有回退路径 ——
-  - 默认引擎（Qwen3-ASR）：铺到 `core/server/engines/qwen_asr_gguf/inference/bin/`
-  - 用 Fun-ASR-Nano：铺到 `core/server/engines/fun_asr_gguf/inference/bin/`
-  - 要文件转录（需要时间戳对齐）：再铺一份到
-    `core/server/engines/force_aligner_gguf/inference/bin/`
+  三个 GGUF 引擎（Qwen3-ASR / Fun-ASR-Nano / 对齐器）**共用同一份**，铺到这一个目录就行：
 
-  版本与下载地址见各目录里的 `llama.cpp二进制下载到这里.txt`（本仓库用 b10621）。
-- **模型**：放到 `models/` 下，结构见 `config_server.py` 的 `ModelPaths`。
+  ```
+  core/server/engines/llama/bin/
+  ```
+
+  > 别被各引擎目录下那个 `inference/bin/` 骗了 —— 那是**旧版说明**的产物。
+  > 实测（`logs/_probe_engine_llama_bind.py`）：三个引擎的 `inference/__init__.py`
+  > 都写了 `from ...llama import llama`，实际绑上的是共享那份；运行时日志里能看到
+  > 「初始化 llama.cpp，跳转至：…\core\server\engines\llama\bin」。
+  > 往 `inference/bin` 装既不会生效，那份旧绑定还和新版 DLL 对不上
+  > （会把 `llama_context_params` 读成 136 字节、真实 160 → `n_threads=0`、`rope_freq_base=nan`）。
+
+  版本与下载地址见该目录里的 `llama.cpp二进制下载到这里.txt`（本仓库用 b10621）。
+- **模型**：放到 `models/` 下，结构见 [`core/tools/model_paths.py`](core/tools/model_paths.py)
+  （启动预检就是照它核对的）。
 
 ### 打包发行版
 
