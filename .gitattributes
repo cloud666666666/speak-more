@@ -1,8 +1,12 @@
-# 换行符统一为 LF（仓库里和工作区里都是）。
+# 换行符规则。**顺序有讲究：后匹配的行优先** ——
+# 所以 `*.bat eol=crlf` 必须放在通用行**后面**，否则会被它覆盖、形同虚设
+# （2026-10 踩过：那条规则一直没生效，四个 .bat 实际是 LF 存下来的，
+#   而 cmd.exe 解析 LF 的批处理文件会读串行 —— 退出时把 rem 注释里的
+#   单词当命令执行，控制台里冒出一串"'stdout' 不是内部或外部命令"。
+#   对照实验见 logs/_exp_bat_eol.py。）
 #
-# 这里**不要**再写 `*.bat text eol=crlf` —— 它会被下面那行通用规则覆盖
-# （gitattributes 后匹配的行优先），名不副实、反而误导。
-# 实测四个 .bat 现在就是 LF 跑的：`git check-attr eol -- <bat>` = lf，
-# 本机天天在用没出过问题（也没有 goto/label 这类对 CRLF 敏感的写法）。
-# 真需要 CRLF 时：把通用行挪到前面、bat 那行放最后。
+# 通用：仓库里统一存 LF（文本文件）
 * text=auto eol=lf
+
+# Windows 批处理：必须 CRLF（cmd.exe 的要求，不是审美问题）
+*.bat text eol=crlf
