@@ -143,6 +143,11 @@
     - [`recording_overlay.py`](core/ui/recording_overlay.py) - 录音浮层：屏幕下方一条跟着声音起伏的**波形带**（对标 Typeless）。画法是 **Pillow 离屏渲染再贴到 Tk 画布**（Tk 没有抗锯齿，直接画曲线会毛糙；放大 3 倍画再缩回来当抗锯齿）。外观旋钮都在文件头部：`WAVE_GAIN`（波形长多高，0.6 = 现在这档）、`GLOW`（外发光）、`SAMPLES`（采样点）、`DB_FLOOR`/`DB_CEIL`（电平映射）。**Pillow 不在时有竖条兜底**；渲染失败只写 debug 日志、绝不影响录音
         - 出预览图：`logs/_verify_overlay_wave.py`（离屏渲染，会写 `logs/overlay_wave_preview.png` + `.gif`），调外观时先看它、别每次去录音试
     - ⚠️ **工作线程不能碰 Tk**（连 `after()` 都不行）：对话框打开时（主线程在 `wait_window`）会卡住或抛 `RuntimeError: main thread is not in main loop`，异常被 `except` 吞掉后表现就是"点了没反应"（测试麦克风 / 测试连接都中过招）。回传结果用 [`dialogs.py`](core/ui/dialogs.py) 的 `ThreadSlot` + `poll_slot`
+- ⚠️ **四个 `.bat` 必须是 CRLF 换行**（cmd.exe 的硬要求，不是审美）：LF 的批处理文件会让 cmd 
+  读串行，**跑到文件尾之后去重读碎片**，把 `rem` 注释里的单词当命令执行 —— 现象是"程序跑得好好的，
+  退出后控制台冒出一串 `'stdout' 不是内部或外部命令`"。对照实验见 `logs/_exp_bat_eol.py`。
+  保证手段是 `.gitattributes` 里的 `*.bat text eol=crlf`，**但它必须写在通用规则 `* text=auto eol=lf` 后面**
+  （gitattributes 后匹配的行优先）—— 写在前面等于没有，2026-10 就这么踩过一次。
 - **协议**: [`core/protocol.py`](core/protocol.py) — `AudioMessage` + `RecognitionMessage`
 - **日志**: `logs/client_latest.log` & `logs/server_latest.log`（排查问题唯一入口）
 
