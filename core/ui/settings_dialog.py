@@ -23,7 +23,7 @@
         'role_names':   ['默认', ...],
         'current_role': '默认',
         'devices':      [(显示名, 设备名), ...],   # 麦克风候选，首项是「系统默认」
-        'meta':         '补丁 v0.1.0 · ...',        # 底部状态栏
+        'meta':         '补丁 v1.0 · ...',        # 底部状态栏
         'base_version': '2.6',
     }
     DialogResult.data = {

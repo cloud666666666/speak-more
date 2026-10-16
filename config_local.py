@@ -32,7 +32,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-PATCH_VERSION = '0.1.0'
+PATCH_VERSION = '1.0'
 SCHEMA_VERSION = 1
 
 # 打包（PyInstaller）后 __file__ 可能指向 bundle 内部（internal/），
