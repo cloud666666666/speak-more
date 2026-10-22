@@ -74,6 +74,14 @@ class ShortcutTask:
         """启动录音任务"""
         logger.info(f"[{self.shortcut.key}] 触发：开始录音")
 
+        # [补丁] 空闲自动关麦之后，按下快捷键要先确保音频流是开着的，
+        # 否则这次录音的 begin 与首块音频根本没地方来（流还没打开）。
+        # 放在这里（阈值计时之前）是为了让打开设备的那几十毫秒被阈值吃掉。
+        try:
+            self.app.stream.ensure_running()
+        except Exception as e:
+            logger.warning(f'录音前打开音频流失败: {e}')
+
         # 记录开始时间
         self.recording_start_time = time.time()
         self.is_recording = True

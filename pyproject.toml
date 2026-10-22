@@ -1,6 +1,6 @@
 [project]
 name = "capswriter-offline"
-version = "1.0.0"
+version = "1.1.0"
 description = "CapsWriter-Offline 离线语音输入工具"
 requires-python = ">=3.14"
 

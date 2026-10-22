@@ -18,7 +18,9 @@
 - **配置化**: [`config_client.py`](config_client.py) / [`config_server.py`](config_server.py) 及 `hot*.txt`、[`LLM/*.py`](LLM/) 位于根目录。
   **本分支的运行时配置不回写这些文件**：设置走 [`config_local.py`](config_local.py) 的
   `config_local.json` 覆盖层，优先级 = 源码默认 < 补丁默认(`PATCH_*`) < JSON。
-- **版本**: 上游内核 v2.6；本分支外壳 **v1.0**（2026-10-16 定版；v0.1 首发 2026-10-13）
+- **版本**: 上游内核 v2.6；本分支外壳 **v1.1**（2026-10-22；v1.0 2026-10-16 定版；v0.1 首发 2026-10-13）
+  v1.1 主要变化：**麦克风按需占用** —— 空闲自动释放采集流，Windows 任务栏的
+  「麦克风正在使用」图标不再常亮（见下方 `audio/` 那条 ⚠️）。
   显示在设置面板底部的「补丁 v…」= `config_local.PATCH_VERSION`；发行版见
   <https://github.com/cloud666666666/speak-more/releases>
 
@@ -106,6 +108,7 @@
     - [`state.py`](core/client/state.py) - `ClientState` 共享状态
     - [`connection/websocket_manager.py`](core/client/connection/websocket_manager.py) - `WebSocketManager`
     - [`audio/`](core/client/audio/) - `AudioStreamManager` / `Recorder` / `FileManager`
+        - ⚠️ **上游的输入流是"启动即开、一直不关"的**（`mic_runner.start_resources` → `stream.start()`），所以只要客户端在跑，Windows 任务栏就会显示「麦克风正在使用」——哪怕一整天没按过快捷键（快捷键只切 `state.recording`，回调里 `if not state.recording: return` 丢数据，但**设备是开着的**）。本分支加了「空闲自动释放麦克风」：`stream._watch_idle()` 在非录音、非测麦时空闲 `mic_idle_close_seconds`（默认 60）秒就 `stop()`；`shortcut/task.py:launch()` 先 `stream.ensure_running()` 把流开回来；测麦克风走 `recording_overlay.set_test_mode`（看门狗 `_held_open()` 认这个状态，不会中途关）。两个键在 `config_local.EXTRA_CLIENT_DEFAULTS`（`mic_idle_release` / `mic_idle_close_seconds`），设置「麦克风」页可改。**`mic_idle_release=False` 即上游行为**。排查"麦克风图标为什么亮"先看这两个开关
         - ⚠️ `queue_in` 是**所有录音会话共用**的：松开快捷键那一瞬间，音频回调可能把最后一块推在 `finish` 后面，本会话读不到就走了 —— 那块音频会被**下一次录音**当成自己的开头，于是下一句里混进上一句的尾音。取消路径本来就排空，**正常结束路径也要排**（`recorder._drop_stale_blocks`，按时间戳只丢早于本次结束时刻的块 —— 直接原地过滤内部 deque，取出再放回会打乱顺序）
     - [`shortcut/`](core/client/shortcut/) - `ShortcutManager`（pynput）快捷键系统
         - ⚠️ **单击模式（`hold_mode=False`）会被按键自动重复打成筛子**：按住不放时 Windows 每 ~30ms 送一次 keydown，而"点一下开始／再点一下结束"的开关语义会把每一次重复都当成一次点击 → 录音 30ms 一开一停。挡法是 `task.pressed`（按下置位、keyup 清位，重复事件直接丢），实现在 [`event_handler.py`](core/client/shortcut/event_handler.py)

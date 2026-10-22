@@ -143,7 +143,8 @@ class CapsWriterClient:
         # 1. 停止核心运行组件
         self.udp.stop()
         self.shortcut.stop()
-        self.stream.stop()
+        # [补丁] 用 dispose() 而不是 stop()：dispose 会顺带让空闲看门狗线程退出
+        self.stream.dispose()
 
         # 2. 托盘资源
         self.tray.stop()

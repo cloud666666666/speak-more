@@ -32,7 +32,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-PATCH_VERSION = '1.0'
+PATCH_VERSION = '1.1'
 SCHEMA_VERSION = 1
 
 # 打包（PyInstaller）后 __file__ 可能指向 bundle 内部（internal/），
@@ -55,6 +55,13 @@ EXTRA_CLIENT_DEFAULTS: Dict[str, Any] = {
     'mic_device_index': -1,         # 设备名匹配不到时的兜底索引，-1 = 不用
     'show_recording_overlay': True,  # 录音时是否显示屏幕下方的波形浮层
     'copy_result_to_clipboard': True,  # 识别结果自动放一份进剪贴板
+    # 空闲自动释放麦克风（设置面板「麦克风」页）：
+    # 上游是启动就开一路常驻 InputStream、一直不关，Windows 任务栏的
+    # 「麦克风正在使用」图标因此常亮。这里改成安静够久就关流、按快捷键时
+    # 自动重开，兼顾低延迟和隐私观感。实现见 core/client/audio/stream.py
+    # 的 _watch_idle()；关掉 mic_idle_release 即回到上游的常开行为。
+    'mic_idle_release': True,        # 不用时自动关闭采集流
+    'mic_idle_close_seconds': 60,    # 空闲多少秒后关流；0 = 一直开着
     # 历史保留时长（设置面板「记录」页）：'forever'/'365'/'30'/'7'/'1'/'never'
     # 清理在客户端启动时执行，实现见 core/client/history.py:purge()
     'history_keep': 'forever',

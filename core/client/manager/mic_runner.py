@@ -34,7 +34,15 @@ class MicRunner:
         TipsDisplay.show_mic_tips()
 
         # 3. 开启运行组件 (音频流、快捷键监听)
-        self.app.stream.start()
+        # [补丁] 开了「空闲自动释放麦克风」时**不在启动阶段预热音频流**：
+        # 上游是一启动就开一路常驻 InputStream，Windows 任务栏的
+        # 「麦克风正在使用」图标因此一直亮。改成按下快捷键时再开
+        # （shortcut/task.py → stream.ensure_running）。关掉这个开关
+        # 则完全维持上游行为（启动即开、常开）。
+        if self.app.stream.idle_release_enabled:
+            logger.info('已开启「空闲自动释放麦克风」：音频流按需打开')
+        else:
+            self.app.stream.start()
         self.app.shortcut.start()
         
         # 4. 开启 UDP 控制 (如果启用)

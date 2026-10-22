@@ -244,6 +244,15 @@ GROUPS: Tuple[Group, ...] = (
         fields=(
             Field('mic_device', '输入设备', 'choice', '',
                   hint='按设备名保存（不是编号），换 USB 口也不会错位'),
+            # [补丁] 上游的音频流是启动就开、一直不关，Windows 任务栏会一直
+            # 显示「麦克风正在使用」。这两项控制"空闲多久后自动关流"。
+            # 实现见 core/client/audio/stream.py 的 _watch_idle()。
+            Field('mic_idle_release', '不用时自动释放麦克风', 'bool', True,
+                  hint='安静一段时间后关掉采集流，任务栏的麦克风图标会消失。'
+                       '下次按快捷键会自动重新打开（第一句多等几十毫秒）'),
+            Field('mic_idle_close_seconds', '空闲多少秒后释放', 'int', 60,
+                  section='advanced',
+                  hint='默认 60 秒。填 0 = 一直开着（等于关掉上面那项）'),
             Field('mic_seg_duration', '录音分段长度（秒）', 'int', 60,
                   effect='restart', section='advanced'),
             Field('mic_seg_overlap', '录音分段重叠（秒）', 'int', 4,

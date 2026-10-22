@@ -43,6 +43,7 @@ class AudioStreamManager:
 
     SAMPLE_RATE = 48000
     BLOCK_DURATION = 0.05  # 50ms
+    IDLE_CHECK_INTERVAL = 1.0  # [补丁] 空闲看门狗多久查一次（秒）
 
     def __init__(self, app: CapsWriterClient):
         """
@@ -54,6 +55,100 @@ class AudioStreamManager:
         self.app = app
         self._channels = 1
         self._running = False  # 标志是否应该运行
+
+        # [补丁] 空闲自动关麦。
+        #
+        # 上游的输入流是"启动就开、一直开"（mic_runner.start_resources 里
+        # 一次 start()），所以只要客户端在跑，Windows 任务栏的
+        # 「麦克风正在使用」图标就会一直亮 —— 哪怕用户一整天没按过快捷键。
+        # 这里加一条看门狗线程：安静够久就把流关掉释放设备，下次录音
+        # （task.launch → ensure_running）或设置里「测试麦克风」（reopen）
+        # 时再自动打开。开关与时长见 config_local 的 mic_idle_release /
+        # mic_idle_close_seconds。
+        self._last_active = time.time()   # 最后一次"真的在用麦克风"的时刻
+        self._disposed = False            # 退出时置位，看门狗自行退出
+        threading.Thread(target=self._watch_idle, daemon=True,
+                         name='MicIdleWatch').start()
+
+    # ---------------- 空闲自动关麦 ----------------
+
+    @property
+    def idle_close_seconds(self) -> float:
+        """空闲多少秒后关流；<= 0 表示一直开着（上游行为）。配置坏了按 60。"""
+        try:
+            from config_client import ClientConfig as Config
+            return float(getattr(Config, 'mic_idle_close_seconds', 60) or 0)
+        except Exception:
+            return 60.0
+
+    @property
+    def idle_release_enabled(self) -> bool:
+        """「不用时自动释放麦克风」开关是否生效。"""
+        try:
+            from config_client import ClientConfig as Config
+            if not bool(getattr(Config, 'mic_idle_release', True)):
+                return False
+            return self.idle_close_seconds > 0
+        except Exception:
+            return False
+
+    def _held_open(self) -> bool:
+        """当前是不是"正用着麦克风"：录音中，或设置向导里正在测麦克风。"""
+        try:
+            if self.state.recording:
+                return True
+        except Exception:
+            pass
+        try:
+            from core.ui.recording_overlay import is_test_mode
+            return bool(is_test_mode())
+        except Exception:
+            return False
+
+    def mark_active(self) -> None:
+        """记一次"在用麦克风"，把空闲计时重新拨回 0。"""
+        self._last_active = time.time()
+
+    def ensure_running(self) -> Optional[sd.InputStream]:
+        """
+        录音前调用：流被空闲关掉时把它重新打开。
+
+        `task.launch()` 在按下快捷键的第一时间调这里，所以"空闲自动关麦"
+        不会让第一句丢掉开头 —— 打开流（PortAudio 约几十毫秒）发生在
+        阈值计时（默认 0.3s）之前。
+        """
+        self.mark_active()
+        if self._running and self.state.stream is not None:
+            return self.state.stream
+        return self.start()
+
+    def _watch_idle(self) -> None:
+        """看门狗：没在用麦克风且空闲超过阈值时关掉采集流。"""
+        while not self._disposed:
+            time.sleep(self.IDLE_CHECK_INTERVAL)
+            try:
+                if self._disposed or not self._running:
+                    continue
+                if self._held_open():
+                    # 录音中 / 正在测麦克风：一直算"在用"
+                    self.mark_active()
+                    continue
+                if not self.idle_release_enabled:
+                    continue
+                seconds = self.idle_close_seconds
+                idle = time.time() - self._last_active
+                if idle < seconds:
+                    continue
+                logger.info(f'麦克风空闲 {idle:.0f}s（阈值 {seconds:.0f}s），'
+                            f'自动关闭音频流（按快捷键会自动重开）')
+                self.stop()
+            except Exception as e:                      # pragma: no cover
+                logger.debug(f'空闲看门狗出错: {e}')
+
+    def dispose(self) -> None:
+        """退出时调用：停掉看门狗线程并关闭音频流。"""
+        self._disposed = True
+        self.stop()
 
     @property
     def state(self) -> ClientState:
@@ -163,6 +258,7 @@ class AudioStreamManager:
 
             self.state.stream = stream
             self._running = True
+            self._last_active = time.time()   # [补丁] 刚打开，空闲计时从头算
             logger.debug(
                 f"音频流已启动: 采样率={self.SAMPLE_RATE}, "
                 f"块大小={int(self.BLOCK_DURATION * self.SAMPLE_RATE)}"
